@@ -1,0 +1,11 @@
+[Unit]
+Description=Send RouterWatch report Saturday at 6 AM Eastern
+
+[Timer]
+OnCalendar=Sat *-*-* 06:00:00 America/New_York
+Persistent=true
+AccuracySec=1min
+Unit=routerwatch-weekly.service
+
+[Install]
+WantedBy=timers.target

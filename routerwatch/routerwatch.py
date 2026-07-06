@@ -11,13 +11,14 @@ import sqlite3
 import ssl
 import subprocess
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from html import unescape
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -378,11 +379,19 @@ def init_db(db_path: Path) -> None:
                 subject TEXT NOT NULL,
                 text_body TEXT NOT NULL,
                 html_body TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'degradation',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
             )
             """
         )
+        outbox_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(alert_outbox)").fetchall()
+        }
+        if "kind" not in outbox_columns:
+            conn.execute(
+                "ALTER TABLE alert_outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'degradation'"
+            )
         conn.commit()
 
 
@@ -472,12 +481,22 @@ def last_event(db_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
-def pending_alert(db_path: Path) -> Optional[Dict[str, Any]]:
+def pending_alert(db_path: Path, kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM alert_outbox WHERE sent_at IS NULL ORDER BY id LIMIT 1"
-        ).fetchone()
+        if kind:
+            row = conn.execute(
+                """
+                SELECT * FROM alert_outbox
+                WHERE sent_at IS NULL AND kind = ?
+                ORDER BY id LIMIT 1
+                """,
+                (kind,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM alert_outbox WHERE sent_at IS NULL ORDER BY id LIMIT 1"
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -487,17 +506,18 @@ def queue_alert(
     text_body: str,
     html_body: str,
     error: str,
+    kind: str = "degradation",
 ) -> None:
-    if pending_alert(db_path):
+    if pending_alert(db_path, kind):
         return
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO alert_outbox (
-                created_at, subject, text_body, html_body, attempts, last_error
-            ) VALUES (?, ?, ?, ?, 1, ?)
+                created_at, subject, text_body, html_body, kind, attempts, last_error
+            ) VALUES (?, ?, ?, ?, ?, 1, ?)
             """,
-            (utc_iso(), subject, text_body, html_body, error),
+            (utc_iso(), subject, text_body, html_body, kind, error),
         )
         conn.commit()
 
@@ -761,6 +781,270 @@ def recovery_outage_summary(
     return text, html
 
 
+def new_metrics() -> Dict[str, Any]:
+    return {
+        "checks": 0,
+        "available": 0,
+        "dns_failures": 0,
+        "latencies": [],
+        "losses": [],
+    }
+
+
+def add_metric(metrics: Dict[str, Any], row: Dict[str, Any]) -> None:
+    metrics["checks"] += 1
+    available = bool(
+        row["gateway_ok"] and row["internet_ok"] and row["dns_ok"] and row["https_ok"]
+    )
+    metrics["available"] += int(available)
+    metrics["dns_failures"] += int(not row["dns_ok"])
+    if row["avg_latency_ms"] is not None:
+        metrics["latencies"].append(float(row["avg_latency_ms"]))
+    if row["packet_loss_percent"] is not None:
+        metrics["losses"].append(float(row["packet_loss_percent"]))
+
+
+def percentile(values: List[float], percent: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * percent)))
+    return ordered[index]
+
+
+def metric_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    checks = metrics["checks"]
+    latencies = metrics["latencies"]
+    losses = metrics["losses"]
+    return {
+        "checks": checks,
+        "uptime": (metrics["available"] / checks * 100) if checks else None,
+        "dns_failures": metrics["dns_failures"],
+        "latency_avg": (sum(latencies) / len(latencies)) if latencies else None,
+        "latency_p95": percentile(latencies, 0.95),
+        "latency_worst": max(latencies) if latencies else None,
+        "loss_avg": (sum(losses) / len(losses)) if losses else None,
+        "loss_worst": max(losses) if losses else None,
+    }
+
+
+def health_analysis(
+    config: Dict[str, Any],
+    db_path: Path,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    now = now or utc_now()
+    week_start = now - timedelta(days=7)
+    prior_start = week_start - timedelta(days=7)
+    lifetime = new_metrics()
+    weekly = new_metrics()
+    prior = new_metrics()
+    episodes = []
+    active = None
+    episode_days: Counter = Counter()
+    episode_hours: Counter = Counter()
+    firmware_changes = []
+    previous_firmware = None
+    first_at = None
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT checked_at, gateway_ok, internet_ok, dns_ok, https_ok,
+                   avg_latency_ms, packet_loss_percent, router_firmware_version, notes
+            FROM checks ORDER BY id
+            """
+        )
+        for raw in rows:
+            row = dict(raw)
+            checked_at = parse_utc(row["checked_at"])
+            first_at = first_at or checked_at
+            add_metric(lifetime, row)
+            if checked_at >= week_start:
+                add_metric(weekly, row)
+            elif checked_at >= prior_start:
+                add_metric(prior, row)
+
+            firmware = row["router_firmware_version"]
+            if firmware and previous_firmware and firmware != previous_firmware:
+                firmware_changes.append(
+                    {
+                        "at": row["checked_at"],
+                        "from": previous_firmware,
+                        "to": firmware,
+                    }
+                )
+            if firmware:
+                previous_firmware = firmware
+
+            core_failure = not bool(
+                row["gateway_ok"]
+                and row["internet_ok"]
+                and row["dns_ok"]
+                and row["https_ok"]
+            )
+            warning = any(
+                marker in (row["notes"] or "")
+                for marker in ("high packet loss:", "high latency:", "weak Wi-Fi signal:")
+            )
+            affected = core_failure or warning
+            if affected and active is None:
+                local_start = checked_at.astimezone(display_timezone(config))
+                active = {
+                    "start": checked_at,
+                    "last": checked_at,
+                    "outage": core_failure,
+                }
+                episode_days[local_start.strftime("%A")] += 1
+                episode_hours[local_start.strftime("%-I %p")] += 1
+            elif affected:
+                active["last"] = checked_at
+                active["outage"] = active["outage"] or core_failure
+            elif active is not None:
+                active["end"] = checked_at
+                episodes.append(active)
+                active = None
+
+    if active is not None:
+        active["end"] = now
+        episodes.append(active)
+
+    return {
+        "generated_at": now,
+        "week_start": week_start,
+        "first_at": first_at,
+        "weekly": metric_summary(weekly),
+        "prior": metric_summary(prior),
+        "lifetime": metric_summary(lifetime),
+        "weekly_episodes": [
+            episode for episode in episodes if episode["end"] >= week_start
+        ],
+        "lifetime_episode_count": len(episodes),
+        "common_day": episode_days.most_common(1)[0] if episode_days else None,
+        "common_hour": episode_hours.most_common(1)[0] if episode_hours else None,
+        "weekly_firmware_changes": [
+            change
+            for change in firmware_changes
+            if parse_utc(change["at"]) >= week_start
+        ],
+        "lifetime_firmware_changes": firmware_changes,
+        "current_firmware": previous_firmware,
+    }
+
+
+def number(value: Optional[float], suffix: str = "", digits: int = 2) -> str:
+    return "N/A" if value is None else f"{value:.{digits}f}{suffix}"
+
+
+def trend(current: Optional[float], previous: Optional[float], suffix: str) -> str:
+    if current is None or previous is None:
+        return "prior-week comparison unavailable"
+    delta = current - previous
+    if abs(delta) < 0.005:
+        return "unchanged from prior week"
+    direction = "higher" if delta > 0 else "lower"
+    return f"{abs(delta):.2f}{suffix} {direction} than prior week"
+
+
+def weekly_report_content(
+    config: Dict[str, Any],
+    db_path: Path,
+    now: Optional[datetime] = None,
+) -> Tuple[str, str]:
+    analysis = health_analysis(config, db_path, now)
+    weekly = analysis["weekly"]
+    prior = analysis["prior"]
+    lifetime = analysis["lifetime"]
+    tz = display_timezone(config)
+    generated = analysis["generated_at"].astimezone(tz)
+    week_start = analysis["week_start"].astimezone(tz)
+    first_at = analysis["first_at"]
+
+    lines = [
+        "RouterWatch weekly health report",
+        f"Period: {week_start.strftime('%Y-%m-%d %I:%M %p %Z')} to {generated.strftime('%Y-%m-%d %I:%M %p %Z')}",
+        "",
+        "THIS WEEK",
+        f"Checks: {weekly['checks']}",
+        f"Uptime: {number(weekly['uptime'], '%', 3)} ({trend(weekly['uptime'], prior['uptime'], ' percentage points')})",
+        f"Latency: avg {number(weekly['latency_avg'], ' ms')}, p95 {number(weekly['latency_p95'], ' ms')}, worst {number(weekly['latency_worst'], ' ms')}",
+        f"Latency trend: {trend(weekly['latency_avg'], prior['latency_avg'], ' ms')}",
+        f"Packet loss: avg {number(weekly['loss_avg'], '%')}, worst {number(weekly['loss_worst'], '%')}",
+        f"Packet-loss trend: {trend(weekly['loss_avg'], prior['loss_avg'], ' percentage points')}",
+        f"DNS failures: {weekly['dns_failures']}",
+        "",
+        "OUTAGES AND DEGRADATIONS",
+    ]
+
+    weekly_episodes = analysis["weekly_episodes"]
+    if weekly_episodes:
+        for episode in weekly_episodes[:25]:
+            start = episode["start"].astimezone(tz)
+            end = episode["end"].astimezone(tz)
+            kind = "Outage" if episode["outage"] else "Degradation"
+            duration = format_duration(episode["start"].isoformat(), episode["end"].isoformat())
+            lines.append(
+                f"- {kind}: {start.strftime('%a %Y-%m-%d %I:%M %p %Z')} to "
+                f"{end.strftime('%I:%M %p %Z')} ({duration})"
+            )
+        if len(weekly_episodes) > 25:
+            lines.append(f"- {len(weekly_episodes) - 25} additional episodes omitted")
+    else:
+        lines.append("None recorded.")
+
+    lines.extend(["", "FIRMWARE"])
+    if analysis["weekly_firmware_changes"]:
+        for change in analysis["weekly_firmware_changes"]:
+            changed_local = parse_utc(change["at"]).astimezone(tz)
+            lines.append(
+                f"- {changed_local.strftime('%Y-%m-%d %I:%M %p %Z')}: "
+                f"{change['from']} -> {change['to']}"
+            )
+    else:
+        lines.append("No firmware changes this week.")
+    lines.append(f"Current firmware: {analysis['current_firmware'] or 'unknown'}")
+
+    history_start = (
+        first_at.astimezone(tz).strftime("%Y-%m-%d %I:%M %p %Z")
+        if first_at
+        else "no data"
+    )
+    common_day = analysis["common_day"]
+    common_hour = analysis["common_hour"]
+    lines.extend(
+        [
+            "",
+            f"ALL-TIME TREND (since {history_start})",
+            f"Checks: {lifetime['checks']}",
+            f"Uptime: {number(lifetime['uptime'], '%', 3)}",
+            f"Latency: avg {number(lifetime['latency_avg'], ' ms')}, p95 {number(lifetime['latency_p95'], ' ms')}, worst {number(lifetime['latency_worst'], ' ms')}",
+            f"Packet loss: avg {number(lifetime['loss_avg'], '%')}, worst {number(lifetime['loss_worst'], '%')}",
+            f"DNS failures: {lifetime['dns_failures']}",
+            f"Outage/degradation episodes: {analysis['lifetime_episode_count']}",
+            (
+                f"Most common start day: {common_day[0]} ({common_day[1]} episodes)"
+                if common_day
+                else "Most common start day: no episodes"
+            ),
+            (
+                f"Most common start hour: {common_hour[0]} ({common_hour[1]} episodes)"
+                if common_hour
+                else "Most common start hour: no episodes"
+            ),
+            f"Firmware changes recorded: {len(analysis['lifetime_firmware_changes'])}",
+        ]
+    )
+    text = "\n".join(lines)
+    html = (
+        '<div style="font-family:Arial,sans-serif;max-width:800px">'
+        "<h2>RouterWatch weekly health report</h2>"
+        f'<pre style="font-family:Arial,sans-serif;white-space:pre-wrap;line-height:1.45">{escape(text)}</pre>'
+        "</div>"
+    )
+    return text, html
+
+
 def should_alert(config: Dict[str, Any], db_path: Path, result: CheckResult) -> Tuple[bool, str]:
     if not config["alerts"].get("enabled", True):
         return False, "alerts disabled"
@@ -778,7 +1062,7 @@ def should_alert(config: Dict[str, Any], db_path: Path, result: CheckResult) -> 
         for row in recent
     )
     if sustained_warning:
-        if pending_alert(db_path):
+        if pending_alert(db_path, "degradation"):
             return False, "degradation alert pending delivery"
         last = last_event(db_path, "alert_sent")
         if last:
@@ -810,8 +1094,14 @@ def maybe_send_pending_alert(
             alert["html_body"],
         )
         mark_alert_sent(db_path, alert["id"])
-        save_event(db_path, "alert_sent", "queued degradation alert delivered")
-        log(config, config_path, "queued degradation alert delivered")
+        if alert["kind"] == "degradation":
+            event_type = "alert_sent"
+            message = "queued degradation alert delivered"
+        else:
+            event_type = "weekly_report_sent"
+            message = "queued weekly report delivered"
+        save_event(db_path, event_type, message)
+        log(config, config_path, message)
     except Exception as exc:
         record_alert_retry_failure(db_path, alert["id"], str(exc))
         save_event(db_path, "alert_retry_failed", str(exc))
@@ -962,9 +1252,43 @@ def command_send_test(config: Dict[str, Any], config_path: Path) -> int:
     return 0
 
 
+def command_weekly_report(config: Dict[str, Any], config_path: Path) -> int:
+    db_path = resolve_path(config_path, config["storage"].get("database_path", "routerwatch.sqlite"))
+    text_body, html_body = weekly_report_content(config, db_path)
+    local_date = utc_now().astimezone(display_timezone(config)).strftime("%Y-%m-%d")
+    subject = f"RouterWatch weekly health report: {local_date}"
+    try:
+        send_gmail(config, config_path, subject, text_body, html_body)
+        save_event(db_path, "weekly_report_sent", subject)
+        print("Weekly health report sent.")
+    except Exception as exc:
+        queue_alert(
+            db_path,
+            subject,
+            text_body,
+            html_body,
+            str(exc),
+            kind="weekly_report",
+        )
+        save_event(db_path, "weekly_report_queued", str(exc))
+        log(config, config_path, f"weekly report queued: {exc}")
+        print("Weekly health report queued for delivery after connectivity recovers.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Monitor home router and internet health.")
-    parser.add_argument("command", choices=["check", "watch", "status", "send-test", "restart-router"])
+    parser.add_argument(
+        "command",
+        choices=[
+            "check",
+            "watch",
+            "status",
+            "send-test",
+            "weekly-report",
+            "restart-router",
+        ],
+    )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
     args = parser.parse_args()
 
@@ -981,6 +1305,8 @@ def main() -> int:
         return command_status(config, config_path)
     if args.command == "send-test":
         return command_send_test(config, config_path)
+    if args.command == "weekly-report":
+        return command_weekly_report(config, config_path)
     if args.command == "restart-router":
         print(restart_router(config, db_path))
         return 0

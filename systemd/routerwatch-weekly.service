@@ -1,0 +1,13 @@
+[Unit]
+Description=Send RouterWatch weekly health report
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/labairj/routerwatch
+Environment=SENDER_EMAIL=labairj@gmail.com
+ExecStart=/home/labairj/routerwatch/venv/bin/python /home/labairj/routerwatch/routerwatch/routerwatch.py weekly-report --config /home/labairj/routerwatch/routerwatch/config.json
+
+[Install]
+WantedBy=multi-user.target

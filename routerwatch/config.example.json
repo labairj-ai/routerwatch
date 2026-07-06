@@ -31,6 +31,9 @@
     "credentials_path": "credentials.json",
     "cooldown_minutes": 30
   },
+  "reports": {
+    "weekly_schedule": "Saturday 6:00 AM America/New_York"
+  },
   "restart": {
     "enabled": false,
     "command": [],

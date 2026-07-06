@@ -33,6 +33,7 @@ requirements.txt          Python dependencies
 systemd/
   routerwatch.service     Run as a service on the Pi
   routerwatch.timer       Run every minute on the Pi
+  routerwatch-weekly.*    Send the Saturday health report
 ```
 
 Runtime files are intentionally ignored by git:
@@ -115,6 +116,19 @@ Show recent history:
 ./venv/bin/python routerwatch/routerwatch.py status --config routerwatch/config.json
 ```
 
+Send the weekly health report manually:
+
+```bash
+SENDER_EMAIL=labairj@gmail.com ./venv/bin/python routerwatch/routerwatch.py weekly-report --config routerwatch/config.json
+```
+
+The weekly report covers the preceding seven days and includes uptime, latency
+and packet-loss trends against the prior week, DNS failures, firmware changes,
+and the times and durations of outages or degradations. Its all-time section
+uses every persisted check to show lifetime uptime and the most common day and
+hour for incident starts. If Gmail is unavailable, the completed report is
+queued in SQLite and delivered after connectivity recovers.
+
 Status output stores UTC internally but displays local time first. With the default config, timestamps are shown in `America/New_York` with the UTC value in parentheses.
 
 If a complete internet outage prevents Gmail delivery, RouterWatch stores the
@@ -175,17 +189,22 @@ On the Pi:
 ```bash
 sudo cp systemd/routerwatch.service /etc/systemd/system/
 sudo cp systemd/routerwatch.timer /etc/systemd/system/
+sudo cp systemd/routerwatch-weekly.service /etc/systemd/system/
+sudo cp systemd/routerwatch-weekly.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now routerwatch.timer
+sudo systemctl enable --now routerwatch.timer routerwatch-weekly.timer
 ```
 
 Check logs:
 
 ```bash
 journalctl -u routerwatch.service -n 100 --no-pager
+journalctl -u routerwatch-weekly.service -n 100 --no-pager
 ```
 
-The timer runs in the background. You do not need to keep an SSH session open.
+The monitoring timer runs every minute. The weekly timer runs Saturday at
+6:00 AM `America/New_York`, including across daylight-saving changes. Both run
+in the background without an SSH session.
 
 ## Healthy Baseline
 
