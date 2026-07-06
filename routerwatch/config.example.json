@@ -2,7 +2,10 @@
   "router": {
     "name": "Home Router",
     "gateway": "192.168.1.1",
-    "admin_url": "http://192.168.1.1",
+    "admin_url": "https://192.168.1.1",
+    "info_page_path": "/cgi-bin/index.cgi",
+    "connectivity_api_path": "/cgi-bin/connectivity_api",
+    "pods_api_path": "/cgi-bin/pods_api",
     "firmware_version": ""
   },
   "monitor": {

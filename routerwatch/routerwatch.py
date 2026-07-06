@@ -8,6 +8,7 @@ import platform
 import re
 import socket
 import sqlite3
+import ssl
 import subprocess
 import time
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from html import unescape
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -39,6 +42,12 @@ class CheckResult:
     wifi_tx_bitrate: Optional[str]
     default_gateway: Optional[str]
     public_ip: Optional[str]
+    router_model: Optional[str]
+    router_firmware_version: Optional[str]
+    router_serial_number: Optional[str]
+    router_internet_status: Optional[str]
+    router_cloud_status: Optional[str]
+    router_connected_pods: Optional[str]
     notes: List[str]
 
     @property
@@ -240,6 +249,74 @@ def public_ip() -> Optional[str]:
         return None
 
 
+def strip_html(value: str) -> str:
+    text = re.sub(r"<script\b.*?</script>", "", value, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def router_admin_request(url: str, method: str = "GET", data: Optional[bytes] = None) -> Optional[str]:
+    context = ssl._create_unverified_context()
+    try:
+        req = Request(url, data=data, method=method, headers={"User-Agent": "RouterWatch/1.0"})
+        with urlopen(req, timeout=8, context=context) as response:
+            return response.read(50000).decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def router_basic_info(config: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    router = config.get("router", {})
+    gateway = router.get("gateway") or default_gateway() or "192.168.1.1"
+    admin_url = router.get("admin_url") or f"https://{gateway}"
+    info_path = router.get("info_page_path", "/cgi-bin/index.cgi")
+    info_url = urljoin(admin_url.rstrip("/") + "/", info_path.lstrip("/"))
+    body = router_admin_request(info_url)
+
+    values: Dict[str, Optional[str]] = {
+        "router_model": None,
+        "router_firmware_version": None,
+        "router_serial_number": None,
+        "router_internet_status": None,
+        "router_cloud_status": None,
+        "router_connected_pods": None,
+    }
+    if not body:
+        return values
+
+    rows: Dict[str, str] = {}
+    row_pattern = re.compile(
+        r"<div\s+class='data_name[^']*'[^>]*>(.*?)</div>\s*"
+        r"<div\s+class='data_value[^']*'[^>]*>(.*?)</div>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for name_html, value_html in row_pattern.findall(body):
+        name = strip_html(name_html)
+        value = strip_html(value_html)
+        if name:
+            rows[name] = value
+
+    values["router_model"] = rows.get("Model")
+    values["router_firmware_version"] = rows.get("FW Version")
+    values["router_serial_number"] = rows.get("Serial Number")
+    values["router_cloud_status"] = rows.get("Cloud Status")
+
+    connectivity_path = router.get("connectivity_api_path", "/cgi-bin/connectivity_api")
+    connectivity_url = urljoin(admin_url.rstrip("/") + "/", connectivity_path.lstrip("/"))
+    values["router_internet_status"] = router_admin_request(connectivity_url, method="POST", data=b"")
+    if not values["router_internet_status"]:
+        values["router_internet_status"] = rows.get("Internet Status")
+
+    pods_path = router.get("pods_api_path", "/cgi-bin/pods_api")
+    pods_url = urljoin(admin_url.rstrip("/") + "/", pods_path.lstrip("/"))
+    values["router_connected_pods"] = router_admin_request(pods_url, method="POST", data=b"")
+    if not values["router_connected_pods"]:
+        values["router_connected_pods"] = rows.get("Connected Pods S/N")
+
+    return {key: strip_html(value) if value else None for key, value in values.items()}
+
+
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
@@ -272,6 +349,12 @@ def init_db(db_path: Path) -> None:
             "ethernet_operstate": "ALTER TABLE checks ADD COLUMN ethernet_operstate TEXT",
             "ethernet_speed_mbps": "ALTER TABLE checks ADD COLUMN ethernet_speed_mbps INTEGER",
             "ethernet_duplex": "ALTER TABLE checks ADD COLUMN ethernet_duplex TEXT",
+            "router_model": "ALTER TABLE checks ADD COLUMN router_model TEXT",
+            "router_firmware_version": "ALTER TABLE checks ADD COLUMN router_firmware_version TEXT",
+            "router_serial_number": "ALTER TABLE checks ADD COLUMN router_serial_number TEXT",
+            "router_internet_status": "ALTER TABLE checks ADD COLUMN router_internet_status TEXT",
+            "router_cloud_status": "ALTER TABLE checks ADD COLUMN router_cloud_status TEXT",
+            "router_connected_pods": "ALTER TABLE checks ADD COLUMN router_connected_pods TEXT",
         }
         for column, statement in migrations.items():
             if column not in existing_columns:
@@ -297,8 +380,9 @@ def save_check(db_path: Path, result: CheckResult) -> None:
                 checked_at, gateway_ok, internet_ok, dns_ok, https_ok, avg_latency_ms,
                 packet_loss_percent, ethernet_operstate, ethernet_speed_mbps,
                 ethernet_duplex, wifi_rssi_dbm, wifi_tx_bitrate, default_gateway,
-                public_ip, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                public_ip, router_model, router_firmware_version, router_serial_number,
+                router_internet_status, router_cloud_status, router_connected_pods, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result.checked_at,
@@ -315,6 +399,12 @@ def save_check(db_path: Path, result: CheckResult) -> None:
                 result.wifi_tx_bitrate,
                 result.default_gateway,
                 result.public_ip,
+                result.router_model,
+                result.router_firmware_version,
+                result.router_serial_number,
+                result.router_internet_status,
+                result.router_cloud_status,
+                result.router_connected_pods,
                 "\n".join(result.notes),
             ),
         )
@@ -386,6 +476,8 @@ def perform_check(config: Dict[str, Any]) -> CheckResult:
     if rssi is not None and rssi <= int(monitor.get("wifi_weak_rssi_dbm", -70)):
         notes.append(f"weak Wi-Fi signal: {rssi} dBm")
 
+    info = router_basic_info(config)
+
     return CheckResult(
         checked_at=utc_iso(),
         gateway_ok=gateway_ok,
@@ -401,6 +493,12 @@ def perform_check(config: Dict[str, Any]) -> CheckResult:
         wifi_tx_bitrate=bitrate,
         default_gateway=default_gateway(),
         public_ip=public_ip() if internet_ok and https_ok else None,
+        router_model=info.get("router_model"),
+        router_firmware_version=info.get("router_firmware_version"),
+        router_serial_number=info.get("router_serial_number"),
+        router_internet_status=info.get("router_internet_status"),
+        router_cloud_status=info.get("router_cloud_status"),
+        router_connected_pods=info.get("router_connected_pods"),
         notes=notes,
     )
 
@@ -460,6 +558,12 @@ def result_summary(result: CheckResult, config: Optional[Dict[str, Any]] = None)
         f"Wi-Fi bitrate: {result.wifi_tx_bitrate}",
         f"Default gateway: {result.default_gateway}",
         f"Public IP: {result.public_ip}",
+        f"Router model: {result.router_model}",
+        f"Router firmware: {result.router_firmware_version}",
+        f"Router serial: {result.router_serial_number}",
+        f"Router page internet status: {result.router_internet_status}",
+        f"Router cloud status: {result.router_cloud_status}",
+        f"Connected pods: {result.router_connected_pods}",
         "",
         "Notes:",
         *(result.notes or ["No issues recorded."]),
@@ -483,6 +587,12 @@ def result_html(result: CheckResult, config: Optional[Dict[str, Any]] = None) ->
         ("Wi-Fi bitrate", result.wifi_tx_bitrate),
         ("Default gateway", result.default_gateway),
         ("Public IP", result.public_ip),
+        ("Router model", result.router_model),
+        ("Router firmware", result.router_firmware_version),
+        ("Router serial", result.router_serial_number),
+        ("Router page internet status", result.router_internet_status),
+        ("Router cloud status", result.router_cloud_status),
+        ("Connected pods", result.router_connected_pods),
     ]
     row_html = "".join(f"<tr><td>{name}</td><td>{value}</td></tr>" for name, value in rows)
     notes = "<br>".join(result.notes or ["No issues recorded."])
@@ -624,11 +734,13 @@ def command_status(config: Dict[str, Any], config_path: Path) -> int:
     for row in rows:
         healthy = bool(row["gateway_ok"] and row["internet_ok"] and row["dns_ok"] and row["https_ok"])
         local_time, utc_time = format_time_pair(row["checked_at"], config)
+        wifi = f"{row['wifi_rssi_dbm']}dBm" if row["wifi_rssi_dbm"] is not None else "unknown"
         print(
             f"{local_time} (UTC {utc_time}) status={'healthy' if healthy else 'degraded'} "
             f"latency={row['avg_latency_ms']}ms loss={row['packet_loss_percent']}% "
             f"ethernet={row.get('ethernet_operstate')}@{row.get('ethernet_speed_mbps')}Mbps "
-            f"wifi={row['wifi_rssi_dbm']}dBm"
+            f"wifi={wifi} "
+            f"router={row.get('router_model') or 'unknown'} firmware={row.get('router_firmware_version') or 'unknown'}"
         )
     return 0
 
@@ -649,6 +761,12 @@ def command_send_test(config: Dict[str, Any], config_path: Path) -> int:
         wifi_tx_bitrate="test",
         default_gateway=config["router"].get("gateway"),
         public_ip="test",
+        router_model="test",
+        router_firmware_version="test",
+        router_serial_number="test",
+        router_internet_status="test",
+        router_cloud_status="test",
+        router_connected_pods="test",
         notes=["This is a RouterWatch test alert."],
     )
     send_gmail(config, config_path, "RouterWatch test alert", result_summary(result, config), result_html(result, config))

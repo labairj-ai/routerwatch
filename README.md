@@ -18,6 +18,7 @@ Gmail alerting uses the same OAuth pattern as DansbyTracker: `credentials.json` 
 - HTTPS reachability
 - Wi-Fi signal strength from `iw dev <interface> link`
 - Current default route and WAN-facing public IP
+- Spectrum Basic Router Info fields when exposed locally: router model, firmware version, serial number, cloud status, router-page internet status, and connected pod serials
 - Outage start/end times
 - Router restart attempts triggered through a configurable command
 
@@ -65,7 +66,10 @@ For the current wired Pi deployment, `routerwatch/config.json` should include:
 {
   "router": {
     "gateway": "192.168.1.1",
-    "admin_url": "http://192.168.1.1"
+    "admin_url": "https://192.168.1.1",
+    "info_page_path": "/cgi-bin/index.cgi",
+    "connectivity_api_path": "/cgi-bin/connectivity_api",
+    "pods_api_path": "/cgi-bin/pods_api"
   },
   "monitor": {
     "display_timezone": "America/New_York",
@@ -111,6 +115,17 @@ Show recent history:
 ```
 
 Status output stores UTC internally but displays local time first. With the default config, timestamps are shown in `America/New_York` with the UTC value in parentheses.
+
+For Spectrum routers that expose the unauthenticated Basic Router Info page, `check` and `status` also include informational router metadata. These fields are recorded for context only and do not trigger alerts:
+
+```text
+Router model: SAX2V1R
+Router firmware: 1.5.1-1-774475-g202507222305-SAX2V1R-prod
+Router serial: 61RP25110089620
+Router page internet status: Connected
+Router cloud status: Connected
+Connected pods: N/A
+```
 
 Attempt the configured router restart command:
 
@@ -182,4 +197,4 @@ Default gateway: 192.168.1.1
 
 ## Next Best Upgrade
 
-Once you know the router model/admin interface, add a small vendor-specific collector that logs firmware version, channel, client count, WAN errors, and modem signal levels if available. That data is usually the difference between "the internet died" and "the 5 GHz channel got noisy" or "the WAN link dropped."
+Next useful additions are client count, Wi-Fi channel, WAN errors, and modem signal levels if the router or ISP exposes them locally. That data is usually the difference between "the internet died" and "the 5 GHz channel got noisy" or "the WAN link dropped."
