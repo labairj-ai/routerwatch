@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+routerwatch/config.json
+routerwatch.sqlite
+routerwatch.log
+*.log
+token.json
+credentials.json
+out/
+.env

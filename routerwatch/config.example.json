@@ -1,0 +1,40 @@
+{
+  "router": {
+    "name": "Home Router",
+    "gateway": "192.168.1.1",
+    "admin_url": "http://192.168.1.1",
+    "firmware_version": ""
+  },
+  "monitor": {
+    "interval_seconds": 60,
+    "ping_count": 4,
+    "ethernet_interface": "eth0",
+    "wifi_interface": "wlan0",
+    "internet_ping_targets": ["1.1.1.1", "8.8.8.8"],
+    "dns_hosts": ["google.com", "cloudflare.com"],
+    "https_urls": ["https://www.google.com/generate_204", "https://www.cloudflare.com/cdn-cgi/trace"],
+    "packet_loss_alert_percent": 50,
+    "latency_alert_ms": 250,
+    "wifi_weak_rssi_dbm": -70,
+    "outage_checks_before_alert": 2,
+    "recovery_email": true
+  },
+  "alerts": {
+    "enabled": true,
+    "sender": "labairj@gmail.com",
+    "recipients": ["labairj@gmail.com"],
+    "token_path": "token.json",
+    "credentials_path": "credentials.json",
+    "cooldown_minutes": 30
+  },
+  "restart": {
+    "enabled": false,
+    "command": [],
+    "auto_restart_after_failed_checks": 0,
+    "cooldown_minutes": 60
+  },
+  "storage": {
+    "database_path": "routerwatch.sqlite",
+    "log_path": "routerwatch.log"
+  }
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=RouterWatch home network monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/labairj/routerwatch
+Environment=SENDER_EMAIL=labairj@gmail.com
+ExecStart=/home/labairj/routerwatch/venv/bin/python /home/labairj/routerwatch/routerwatch/routerwatch.py check --config /home/labairj/routerwatch/routerwatch/config.json
+SuccessExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
