@@ -1,0 +1,10 @@
+{
+  "name": "routerwatch-matter-controller",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@matter/main": "0.17.4",
+    "@matter/nodejs-ble": "0.17.4"
+  }
+}
