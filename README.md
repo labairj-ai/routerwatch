@@ -68,6 +68,7 @@ For the current wired Pi deployment, `routerwatch/config.json` should include:
     "admin_url": "http://192.168.1.1"
   },
   "monitor": {
+    "display_timezone": "America/New_York",
     "ethernet_interface": "eth0",
     "wifi_interface": "wlan0"
   }
@@ -108,6 +109,8 @@ Show recent history:
 ```bash
 ./venv/bin/python routerwatch/routerwatch.py status --config routerwatch/config.json
 ```
+
+Status output stores UTC internally but displays local time first. With the default config, timestamps are shown in `America/New_York` with the UTC value in parentheses.
 
 Attempt the configured router restart command:
 
@@ -163,6 +166,8 @@ The timer runs in the background. You do not need to keep an SSH session open.
 The initial wired baseline from the Pi looked like this:
 
 ```text
+Checked at local: 2026-07-06 08:02:54 AM EDT
+Checked at UTC: 2026-07-06T12:02:54+00:00
 Gateway OK: True
 Internet ping OK: True
 DNS OK: True

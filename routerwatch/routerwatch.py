@@ -11,12 +11,13 @@ import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -56,6 +57,32 @@ def utc_now() -> datetime:
 
 def utc_iso() -> str:
     return utc_now().isoformat(timespec="seconds")
+
+
+def parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def display_timezone(config: Dict[str, Any]) -> tzinfo:
+    timezone_name = config.get("monitor", {}).get("display_timezone", "").strip()
+    if timezone_name:
+        try:
+            return ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def format_time_pair(value: str, config: Dict[str, Any]) -> Tuple[str, str]:
+    utc_dt = parse_utc(value)
+    local_dt = utc_dt.astimezone(display_timezone(config))
+    return (
+        local_dt.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+        utc_dt.isoformat(timespec="seconds"),
+    )
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -413,11 +440,13 @@ def send_gmail(config: Dict[str, Any], config_path: Path, subject: str, text_bod
     gmail_service(token_path).users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
-def result_summary(result: CheckResult) -> str:
+def result_summary(result: CheckResult, config: Optional[Dict[str, Any]] = None) -> str:
     status = "healthy" if not result.needs_attention else "needs attention"
+    local_time, utc_time = format_time_pair(result.checked_at, config or {})
     lines = [
         f"RouterWatch status: {status}",
-        f"Checked at: {result.checked_at}",
+        f"Checked at local: {local_time}",
+        f"Checked at UTC: {utc_time}",
         f"Gateway OK: {result.gateway_ok}",
         f"Internet ping OK: {result.internet_ok}",
         f"DNS OK: {result.dns_ok}",
@@ -438,7 +467,8 @@ def result_summary(result: CheckResult) -> str:
     return "\n".join(lines)
 
 
-def result_html(result: CheckResult) -> str:
+def result_html(result: CheckResult, config: Optional[Dict[str, Any]] = None) -> str:
+    local_time, utc_time = format_time_pair(result.checked_at, config or {})
     rows = [
         ("Gateway", result.gateway_ok),
         ("Internet ping", result.internet_ok),
@@ -460,7 +490,7 @@ def result_html(result: CheckResult) -> str:
     return f"""
     <div style="font-family:Arial,sans-serif;max-width:720px">
       <h2 style="color:{color};margin-bottom:8px">RouterWatch: {'Healthy' if not result.needs_attention else 'Needs attention'}</h2>
-      <p>Checked at {result.checked_at}</p>
+      <p>Checked at {local_time}<br><span style="color:#666">UTC: {utc_time}</span></p>
       <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #ddd">
         {row_html}
       </table>
@@ -507,7 +537,7 @@ def maybe_send_recovery(config: Dict[str, Any], config_path: Path, db_path: Path
     was_unhealthy = not bool(previous["gateway_ok"] and previous["internet_ok"] and previous["dns_ok"] and previous["https_ok"])
     if was_unhealthy:
         try:
-            send_gmail(config, config_path, "RouterWatch recovered", result_summary(result), result_html(result))
+            send_gmail(config, config_path, "RouterWatch recovered", result_summary(result, config), result_html(result, config))
             save_event(db_path, "recovery_sent", "Network recovered.")
         except Exception as exc:
             save_event(db_path, "recovery_email_failed", str(exc))
@@ -552,13 +582,13 @@ def command_check(config: Dict[str, Any], config_path: Path) -> int:
     init_db(db_path)
     result = perform_check(config)
     save_check(db_path, result)
-    print(result_summary(result))
+    print(result_summary(result, config))
 
     alert, reason = should_alert(config, db_path, result)
     if alert:
         subject = "RouterWatch alert: network degraded"
         try:
-            send_gmail(config, config_path, subject, result_summary(result), result_html(result))
+            send_gmail(config, config_path, subject, result_summary(result, config), result_html(result, config))
             save_event(db_path, "alert_sent", reason)
             log(config, config_path, f"alert sent: {reason}")
         except Exception as exc:
@@ -593,8 +623,9 @@ def command_status(config: Dict[str, Any], config_path: Path) -> int:
         return 0
     for row in rows:
         healthy = bool(row["gateway_ok"] and row["internet_ok"] and row["dns_ok"] and row["https_ok"])
+        local_time, utc_time = format_time_pair(row["checked_at"], config)
         print(
-            f"{row['checked_at']} status={'healthy' if healthy else 'degraded'} "
+            f"{local_time} (UTC {utc_time}) status={'healthy' if healthy else 'degraded'} "
             f"latency={row['avg_latency_ms']}ms loss={row['packet_loss_percent']}% "
             f"ethernet={row.get('ethernet_operstate')}@{row.get('ethernet_speed_mbps')}Mbps "
             f"wifi={row['wifi_rssi_dbm']}dBm"
@@ -620,7 +651,7 @@ def command_send_test(config: Dict[str, Any], config_path: Path) -> int:
         public_ip="test",
         notes=["This is a RouterWatch test alert."],
     )
-    send_gmail(config, config_path, "RouterWatch test alert", result_summary(result), result_html(result))
+    send_gmail(config, config_path, "RouterWatch test alert", result_summary(result, config), result_html(result, config))
     print("Test alert sent.")
     return 0
 

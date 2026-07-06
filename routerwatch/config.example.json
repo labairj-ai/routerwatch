@@ -7,6 +7,7 @@
   },
   "monitor": {
     "interval_seconds": 60,
+    "display_timezone": "America/New_York",
     "ping_count": 4,
     "ethernet_interface": "eth0",
     "wifi_interface": "wlan0",
