@@ -369,6 +369,20 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT,
+                subject TEXT NOT NULL,
+                text_body TEXT NOT NULL,
+                html_body TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+            """
+        )
         conn.commit()
 
 
@@ -435,6 +449,62 @@ def last_event(db_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
             (event_type,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def pending_alert(db_path: Path) -> Optional[Dict[str, Any]]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM alert_outbox WHERE sent_at IS NULL ORDER BY id LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def queue_alert(
+    db_path: Path,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    error: str,
+) -> None:
+    if pending_alert(db_path):
+        return
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO alert_outbox (
+                created_at, subject, text_body, html_body, attempts, last_error
+            ) VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (utc_iso(), subject, text_body, html_body, error),
+        )
+        conn.commit()
+
+
+def mark_alert_sent(db_path: Path, alert_id: int) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE alert_outbox
+            SET sent_at = ?, attempts = attempts + 1, last_error = NULL
+            WHERE id = ?
+            """,
+            (utc_iso(), alert_id),
+        )
+        conn.commit()
+
+
+def record_alert_retry_failure(db_path: Path, alert_id: int, error: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE alert_outbox
+            SET attempts = attempts + 1, last_error = ?
+            WHERE id = ?
+            """,
+            (error, alert_id),
+        )
+        conn.commit()
 
 
 def perform_check(config: Dict[str, Any]) -> CheckResult:
@@ -627,6 +697,8 @@ def should_alert(config: Dict[str, Any], db_path: Path, result: CheckResult) -> 
         for row in recent
     )
     if sustained_warning:
+        if pending_alert(db_path):
+            return False, "degradation alert pending delivery"
         last = last_event(db_path, "alert_sent")
         if last:
             last_at = datetime.fromisoformat(last["event_at"])
@@ -635,6 +707,34 @@ def should_alert(config: Dict[str, Any], db_path: Path, result: CheckResult) -> 
                 return False, "alert cooldown active"
         return True, "consecutive degraded checks"
     return False, "current issue not sustained"
+
+
+def maybe_send_pending_alert(
+    config: Dict[str, Any],
+    config_path: Path,
+    db_path: Path,
+    result: CheckResult,
+) -> None:
+    alert = pending_alert(db_path)
+    if not alert:
+        return
+    if not (result.internet_ok and result.dns_ok and result.https_ok):
+        return
+    try:
+        send_gmail(
+            config,
+            config_path,
+            alert["subject"],
+            alert["text_body"],
+            alert["html_body"],
+        )
+        mark_alert_sent(db_path, alert["id"])
+        save_event(db_path, "alert_sent", "queued degradation alert delivered")
+        log(config, config_path, "queued degradation alert delivered")
+    except Exception as exc:
+        record_alert_retry_failure(db_path, alert["id"], str(exc))
+        save_event(db_path, "alert_retry_failed", str(exc))
+        log(config, config_path, f"queued alert retry failed: {exc}")
 
 
 def maybe_send_recovery(config: Dict[str, Any], config_path: Path, db_path: Path, result: CheckResult) -> None:
@@ -694,16 +794,20 @@ def command_check(config: Dict[str, Any], config_path: Path) -> int:
     save_check(db_path, result)
     print(result_summary(result, config))
 
+    maybe_send_pending_alert(config, config_path, db_path, result)
     alert, reason = should_alert(config, db_path, result)
     if alert:
         subject = "RouterWatch alert: network degraded"
+        text_body = result_summary(result, config)
+        html_body = result_html(result, config)
         try:
-            send_gmail(config, config_path, subject, result_summary(result, config), result_html(result, config))
+            send_gmail(config, config_path, subject, text_body, html_body)
             save_event(db_path, "alert_sent", reason)
             log(config, config_path, f"alert sent: {reason}")
         except Exception as exc:
+            queue_alert(db_path, subject, text_body, html_body, str(exc))
             save_event(db_path, "alert_failed", str(exc))
-            log(config, config_path, f"alert failed: {exc}")
+            log(config, config_path, f"alert failed and queued: {exc}")
     else:
         log(config, config_path, f"no alert: {reason}")
 

@@ -20,6 +20,7 @@ Gmail alerting uses the same OAuth pattern as DansbyTracker: `credentials.json` 
 - Current default route and WAN-facing public IP
 - Spectrum Basic Router Info fields when exposed locally: router model, firmware version, serial number, cloud status, router-page internet status, and connected pod serials
 - Outage start/end times
+- Failed degradation emails queued locally until connectivity returns
 - Router restart attempts triggered through a configurable command
 
 ## Project Layout
@@ -117,6 +118,12 @@ Show recent history:
 ```
 
 Status output stores UTC internally but displays local time first. With the default config, timestamps are shown in `America/New_York` with the UTC value in parentheses.
+
+If a complete internet outage prevents Gmail delivery, RouterWatch stores the
+degradation email in its SQLite outbox. Once internet, DNS, and HTTPS checks
+recover, the missed degradation email is sent automatically before the recovery
+email. The queue survives service and Pi restarts, and only one degradation
+email is queued for an active outage.
 
 For Spectrum routers that expose the unauthenticated Basic Router Info page, `check` and `status` also include informational router metadata. These fields are recorded for context only and do not trigger alerts:
 
