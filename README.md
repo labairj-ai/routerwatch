@@ -43,8 +43,6 @@ Runtime files are intentionally ignored by git:
 - `token.json`
 - `credentials.json`
 - `venv/`
-- `wifi.env`
-- Matter controller fabric state (stored outside the repository)
 
 ## Quick Start On The Pi
 
@@ -144,7 +142,8 @@ Attempt the configured router restart command:
 
 ## Router Restart
 
-Router restart is intentionally model-specific. The safest general pattern is to put the router on a smart plug that can be controlled locally, then set `restart.command` in `config.json`.
+Router restart is intentionally model-specific. Set `restart.command` only when
+the router provides a reliable local reboot command.
 
 Examples:
 
@@ -165,61 +164,6 @@ or, if the router supports SSH reboot:
 ```
 
 RouterWatch will not restart anything unless `restart.enabled` is `true`.
-
-## Matter Smart Plug
-
-The Linkind `ZN10-2` plug has been commissioned to a Matter controller on the Pi
-and verified with manual `off` and `on` commands. Install the controller
-dependencies separately from the Python environment:
-
-```bash
-cd ~/routerwatch/matter
-npm install
-```
-
-Create `~/routerwatch/matter/wifi.env` with mode `600`. Do not commit this file:
-
-```bash
-MATTER_WIFI_SSID='your-ssid'
-MATTER_WIFI_PASSWORD='your-password'
-MATTER_PAIRING_CODE='code-from-plug'
-MATTER_PASSCODE='passcode-from-plug'
-MATTER_SHORT_DISCRIMINATOR='discriminator-from-plug'
-```
-
-Load the settings and commission a factory-reset plug while its indicator is
-blinking:
-
-```bash
-cd ~/routerwatch/matter
-set -a
-source wifi.env
-set +a
-NOBLE_MULTI_ROLE=1 node matter-plug.mjs commission
-```
-
-After commissioning, inspect or control the plug:
-
-```bash
-NOBLE_MULTI_ROLE=1 node matter-plug.mjs info
-NOBLE_MULTI_ROLE=1 node matter-plug.mjs off
-NOBLE_MULTI_ROLE=1 node matter-plug.mjs on
-```
-
-The controller fabric is persisted under
-`~/.matter/routerwatch-controller`. The Pi's Node binary also needs Bluetooth
-network capabilities:
-
-```bash
-sudo setcap cap_net_raw,cap_net_admin+eip /usr/bin/node
-getcap /usr/bin/node
-```
-
-Do not use separate `off` and `on` commands to power-cycle the router. Turning
-off the router also removes the Wi-Fi path the Pi needs to send the subsequent
-`on` command. Automated router recovery requires a plug-local countdown/restart
-feature or an independent control network. Until that is available, Matter plug
-control is informational and manual only.
 
 ## Systemd Timer
 
