@@ -123,6 +123,9 @@ recover, the missed degradation email is sent automatically before the recovery
 email. The queue survives service and Pi restarts, and only one degradation
 email is queued for an active outage.
 
+The recovery email includes the outage start and recovery times, total duration,
+number of failed checks, worst observed latency, and worst observed packet loss.
+
 For Spectrum routers that expose the unauthenticated Basic Router Info page, `check` and `status` also include informational router metadata. These fields are recorded for context only and do not trigger alerts:
 
 ```text

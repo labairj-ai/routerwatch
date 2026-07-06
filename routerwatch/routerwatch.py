@@ -441,6 +441,27 @@ def recent_checks(db_path: Path, limit: int) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def outage_checks_before_recovery(db_path: Path) -> List[Dict[str, Any]]:
+    outage = []
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM checks ORDER BY id DESC")
+        next(rows, None)  # The current healthy check.
+        for row in rows:
+            check = dict(row)
+            healthy = bool(
+                check["gateway_ok"]
+                and check["internet_ok"]
+                and check["dns_ok"]
+                and check["https_ok"]
+            )
+            if healthy:
+                break
+            outage.append(check)
+    outage.reverse()
+    return outage
+
+
 def last_event(db_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -680,6 +701,66 @@ def result_html(result: CheckResult, config: Optional[Dict[str, Any]] = None) ->
     """
 
 
+def format_duration(started_at: str, recovered_at: str) -> str:
+    seconds = max(0, int((parse_utc(recovered_at) - parse_utc(started_at)).total_seconds()))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def recovery_outage_summary(
+    config: Dict[str, Any],
+    db_path: Path,
+    result: CheckResult,
+) -> Tuple[str, str]:
+    checks = outage_checks_before_recovery(db_path)
+    if not checks:
+        return "", ""
+
+    started_at = checks[0]["checked_at"]
+    start_local, start_utc = format_time_pair(started_at, config)
+    recovery_local, recovery_utc = format_time_pair(result.checked_at, config)
+    latencies = [row["avg_latency_ms"] for row in checks if row["avg_latency_ms"] is not None]
+    losses = [
+        row["packet_loss_percent"]
+        for row in checks
+        if row["packet_loss_percent"] is not None
+    ]
+    worst_latency = f"{max(latencies):.3f} ms" if latencies else "N/A"
+    worst_loss = f"{max(losses):.1f}%" if losses else "N/A"
+    duration = format_duration(started_at, result.checked_at)
+
+    text = "\n".join(
+        [
+            "Outage summary:",
+            f"Start time: {start_local} (UTC {start_utc})",
+            f"Recovery time: {recovery_local} (UTC {recovery_utc})",
+            f"Duration: {duration}",
+            f"Failed checks: {len(checks)}",
+            f"Worst latency: {worst_latency}",
+            f"Worst packet loss: {worst_loss}",
+        ]
+    )
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:720px">
+      <h3>Outage summary</h3>
+      <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #ddd">
+        <tr><td><strong>Start time</strong></td><td>{start_local}<br><span style="color:#666">UTC: {start_utc}</span></td></tr>
+        <tr><td><strong>Recovery time</strong></td><td>{recovery_local}<br><span style="color:#666">UTC: {recovery_utc}</span></td></tr>
+        <tr><td><strong>Duration</strong></td><td>{duration}</td></tr>
+        <tr><td><strong>Failed checks</strong></td><td>{len(checks)}</td></tr>
+        <tr><td><strong>Worst latency</strong></td><td>{worst_latency}</td></tr>
+        <tr><td><strong>Worst packet loss</strong></td><td>{worst_loss}</td></tr>
+      </table>
+    </div>
+    """
+    return text, html
+
+
 def should_alert(config: Dict[str, Any], db_path: Path, result: CheckResult) -> Tuple[bool, str]:
     if not config["alerts"].get("enabled", True):
         return False, "alerts disabled"
@@ -747,7 +828,10 @@ def maybe_send_recovery(config: Dict[str, Any], config_path: Path, db_path: Path
     was_unhealthy = not bool(previous["gateway_ok"] and previous["internet_ok"] and previous["dns_ok"] and previous["https_ok"])
     if was_unhealthy:
         try:
-            send_gmail(config, config_path, "RouterWatch recovered", result_summary(result, config), result_html(result, config))
+            summary_text, summary_html = recovery_outage_summary(config, db_path, result)
+            text_body = "\n\n".join(part for part in (summary_text, result_summary(result, config)) if part)
+            html_body = summary_html + result_html(result, config)
+            send_gmail(config, config_path, "RouterWatch recovered", text_body, html_body)
             save_event(db_path, "recovery_sent", "Network recovered.")
         except Exception as exc:
             save_event(db_path, "recovery_email_failed", str(exc))
