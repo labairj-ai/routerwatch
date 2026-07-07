@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+OUI_VENDOR_CACHE: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -393,6 +394,23 @@ def init_db(db_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE alert_outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'degradation'"
             )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS devices (
+                device_key TEXT PRIMARY KEY,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 0,
+                current_ip TEXT,
+                hostname TEXT,
+                mac TEXT,
+                vendor TEXT,
+                friendly_name TEXT,
+                interface TEXT,
+                state TEXT
+            )
+            """
+        )
         conn.commit()
 
 
@@ -525,6 +543,160 @@ def observed_devices() -> List[Dict[str, Optional[str]]]:
             device.get("ip") or "",
         ),
     )
+
+
+def normalize_mac(mac: Optional[str]) -> Optional[str]:
+    return mac.lower() if mac else None
+
+
+def normalize_oui(mac: Optional[str]) -> Optional[str]:
+    normalized = normalize_mac(mac)
+    if not normalized:
+        return None
+    parts = normalized.split(":")
+    if len(parts) < 3:
+        return None
+    return "".join(parts[:3]).upper()
+
+
+def configured_device_value(config: Dict[str, Any], key: str, device: Dict[str, Optional[str]]) -> Optional[str]:
+    values = config.get("devices", {}).get(key, {})
+    if not isinstance(values, dict):
+        return None
+    candidates = [
+        normalize_mac(device.get("mac")),
+        device.get("ip"),
+        device.get("hostname"),
+    ]
+    for candidate in candidates:
+        if candidate and candidate in values:
+            return str(values[candidate])
+    return None
+
+
+def load_oui_vendors() -> Dict[str, str]:
+    global OUI_VENDOR_CACHE
+    if OUI_VENDOR_CACHE is not None:
+        return OUI_VENDOR_CACHE
+    vendors: Dict[str, str] = {}
+    for path in (
+        Path("/usr/share/ieee-data/oui.txt"),
+        Path("/var/lib/ieee-data/oui.txt"),
+        Path("/usr/share/misc/oui.txt"),
+    ):
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                match = re.match(r"^([0-9A-Fa-f]{2})[-:]?([0-9A-Fa-f]{2})[-:]?([0-9A-Fa-f]{2})\s+\(base 16\)\s+(.+)$", line)
+                if match:
+                    vendors["".join(match.groups()[:3]).upper()] = match.group(4).strip()
+        except OSError:
+            continue
+        if vendors:
+            break
+    OUI_VENDOR_CACHE = vendors
+    return vendors
+
+
+def device_vendor(config: Dict[str, Any], device: Dict[str, Optional[str]]) -> Optional[str]:
+    configured = configured_device_value(config, "vendors", device)
+    if configured:
+        return configured
+    oui = normalize_oui(device.get("mac"))
+    return load_oui_vendors().get(oui or "")
+
+
+def device_key(device: Dict[str, Optional[str]]) -> str:
+    mac = normalize_mac(device.get("mac"))
+    if mac:
+        return f"mac:{mac}"
+    return f"ip:{device.get('interface') or 'unknown'}:{device.get('ip') or 'unknown'}"
+
+
+def update_device_inventory(
+    db_path: Path,
+    config: Dict[str, Any],
+    devices: List[Dict[str, Optional[str]]],
+    seen_at: Optional[str] = None,
+) -> None:
+    seen_at = seen_at or utc_iso()
+    with sqlite3.connect(db_path) as conn:
+        for device in devices:
+            key = device_key(device)
+            mac = normalize_mac(device.get("mac"))
+            friendly_name = configured_device_value(config, "names", device)
+            router = config.get("router", {})
+            if not friendly_name and device.get("ip") == router.get("gateway"):
+                friendly_name = router.get("name", "Home Router")
+            vendor = device_vendor(config, device)
+            conn.execute(
+                """
+                INSERT INTO devices (
+                    device_key, first_seen, last_seen, seen_count, current_ip,
+                    hostname, mac, vendor, friendly_name, interface, state
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_key) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    seen_count = devices.seen_count + 1,
+                    current_ip = excluded.current_ip,
+                    hostname = COALESCE(excluded.hostname, devices.hostname),
+                    mac = COALESCE(excluded.mac, devices.mac),
+                    vendor = COALESCE(excluded.vendor, devices.vendor),
+                    friendly_name = COALESCE(excluded.friendly_name, devices.friendly_name),
+                    interface = excluded.interface,
+                    state = excluded.state
+                """,
+                (
+                    key,
+                    seen_at,
+                    seen_at,
+                    device.get("ip"),
+                    device.get("hostname"),
+                    mac,
+                    vendor,
+                    friendly_name,
+                    device.get("interface"),
+                    device.get("state"),
+                ),
+            )
+        conn.commit()
+
+
+def device_status(row: Dict[str, Any], now: datetime, config: Dict[str, Any]) -> str:
+    last_seen = parse_utc(row["last_seen"])
+    recent_minutes = int(config.get("devices", {}).get("recent_minutes", 15))
+    if now - last_seen > timedelta(minutes=recent_minutes):
+        return "offline"
+    state = (row.get("state") or "").upper()
+    if state in {"REACHABLE", "DELAY", "PROBE"}:
+        return "active"
+    if state == "STALE":
+        return "recent"
+    return "observed"
+
+
+def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, Any]]:
+    now = utc_now()
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT device_key, first_seen, last_seen, seen_count, current_ip,
+                   hostname, mac, vendor, friendly_name, interface, state
+            FROM devices
+            ORDER BY last_seen DESC, current_ip
+            LIMIT 100
+            """
+        ).fetchall()
+    inventory = []
+    for raw in rows:
+        row = dict(raw)
+        row["status"] = device_status(row, now, config)
+        row["first_seen"] = local_display(row["first_seen"], config)
+        row["last_seen"] = local_display(row["last_seen"], config)
+        inventory.append(row)
+    return inventory
 
 
 def outage_checks_before_recovery(db_path: Path) -> List[Dict[str, Any]]:
@@ -1144,6 +1316,7 @@ def row_needs_attention(row: Dict[str, Any]) -> bool:
 
 def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
     init_db(db_path)
+    update_device_inventory(db_path, config, observed_devices())
     checks = recent_checks(db_path, 240)
     latest = checks[0] if checks else None
     analysis = health_analysis(config, db_path)
@@ -1267,7 +1440,7 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
         "thresholds": thresholds,
         "timeline": timeline,
         "recent_checks": recent,
-        "observed_devices": observed_devices(),
+        "devices": device_inventory(config, db_path),
     }
 
 
@@ -1473,9 +1646,9 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
 
     <section>
-      <h2>Observed Local Devices</h2>
-      <div class="muted" style="margin-bottom:8px">Seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
-      <table><thead><tr><th>IP</th><th>Hostname</th><th>Interface</th><th>State</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
+      <h2>Local Device Inventory</h2>
+      <div class="muted" style="margin-bottom:8px">Persisted devices seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
+      <table><thead><tr><th>Name</th><th>Status</th><th>IP</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
     </section>
 
     <section>
@@ -1554,7 +1727,7 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
       document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
-      document.getElementById("devices").innerHTML = data.observed_devices.length ? data.observed_devices.map((d) => row([d.ip, d.hostname || "", d.interface, d.state, d.mac])).join("") : row(["No devices observed", "", "", "", ""]);
+      document.getElementById("devices").innerHTML = data.devices.length ? data.devices.map((d) => row([d.friendly_name || d.hostname || "", d.status, d.current_ip, d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", d.mac])).join("") : row(["No devices observed", "", "", "", "", "", "", "", ""]);
       document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
     }
     async function refresh() {
@@ -1730,6 +1903,7 @@ def command_check(config: Dict[str, Any], config_path: Path) -> int:
     init_db(db_path)
     result = perform_check(config)
     save_check(db_path, result)
+    update_device_inventory(db_path, config, observed_devices(), result.checked_at)
     print(result_summary(result, config))
 
     maybe_send_pending_alert(config, config_path, db_path, result)

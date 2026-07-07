@@ -23,7 +23,7 @@ Gmail alerting uses the same OAuth pattern as DansbyTracker: `credentials.json` 
 - Failed degradation emails queued locally until connectivity returns
 - Router restart attempts triggered through a configurable command
 - Local read-only dashboard for current status, history, incidents, firmware,
-  and queued emails
+  queued emails, and persisted local device inventory
 
 ## Project Layout
 
@@ -140,8 +140,27 @@ http://gameserver.local:8765/
 
 The dashboard is read-only. It shows the latest check, weekly and all-time
 health metrics, recent latency/loss, outages and degradations, router firmware,
-and pending queued emails. It refreshes itself every 30 seconds while the
-existing minute timer continues collecting data.
+pending queued emails, and local device inventory. It refreshes itself every 30
+seconds while the existing minute timer continues collecting data.
+
+The device inventory is based on what the Pi observes in the local neighbor
+table, not a Spectrum router-reported bandwidth list. It persists first seen,
+last seen, seen count, current IP, hostname when resolvable, MAC address,
+interface, state, status, and vendor when the Pi has local OUI data available.
+You can add friendly names in `routerwatch/config.json`:
+
+```json
+"devices": {
+  "recent_minutes": 15,
+  "names": {
+    "2e:67:be:3b:9e:b3": "Spectrum Router",
+    "192.168.4.21": "Kitchen Display"
+  },
+  "vendors": {
+    "2e:67:be:3b:9e:b3": "Spectrum"
+  }
+}
+```
 
 The weekly report covers the preceding seven days and includes uptime, latency
 and packet-loss trends against the prior week, DNS failures, firmware changes,

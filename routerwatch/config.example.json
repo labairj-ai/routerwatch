@@ -34,6 +34,13 @@
   "reports": {
     "weekly_schedule": "Saturday 6:00 AM America/New_York"
   },
+  "devices": {
+    "recent_minutes": 15,
+    "names": {
+      "2e:67:be:3b:9e:b3": "Spectrum Router"
+    },
+    "vendors": {}
+  },
   "restart": {
     "enabled": false,
     "command": [],

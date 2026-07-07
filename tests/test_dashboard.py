@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from routerwatch import routerwatch
 
@@ -79,17 +80,32 @@ class DashboardTest(unittest.TestCase):
                 db_path, result("2026-07-06T13:01:00+00:00", healthy=True)
             )
 
-            payload = routerwatch.dashboard_payload(
-                {
-                    "router": {"name": "Test Router"},
-                    "monitor": {
-                        "display_timezone": "America/New_York",
-                        "latency_alert_ms": 250,
-                        "packet_loss_alert_percent": 50,
-                    },
+            config = {
+                "router": {"name": "Test Router"},
+                "monitor": {
+                    "display_timezone": "America/New_York",
+                    "latency_alert_ms": 250,
+                    "packet_loss_alert_percent": 50,
                 },
-                db_path,
-            )
+                "devices": {
+                    "names": {"2e:67:be:3b:9e:b3": "Spectrum Router"},
+                    "vendors": {"2e:67:be:3b:9e:b3": "Spectrum"},
+                },
+            }
+            with patch.object(
+                routerwatch,
+                "observed_devices",
+                return_value=[
+                    {
+                        "ip": "192.168.1.1",
+                        "interface": "eth0",
+                        "mac": "2e:67:be:3b:9e:b3",
+                        "state": "REACHABLE",
+                        "hostname": "SAX2V1R.lan",
+                    },
+                ],
+            ):
+                payload = routerwatch.dashboard_payload(config, db_path)
 
             self.assertEqual("Test Router", payload["router_name"])
             self.assertEqual("healthy", payload["latest"]["status"])
@@ -103,6 +119,42 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(2, len(payload["weekly_episodes"]))
             self.assertIn("09:00 AM", payload["weekly_episodes"][0]["start"])
             self.assertIn("08:00 AM", payload["weekly_episodes"][1]["start"])
+            self.assertEqual(1, len(payload["devices"]))
+            self.assertEqual("Spectrum Router", payload["devices"][0]["friendly_name"])
+            self.assertEqual("Spectrum", payload["devices"][0]["vendor"])
+            self.assertEqual(1, payload["devices"][0]["seen_count"])
+
+    def test_device_inventory_updates_seen_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "routerwatch.sqlite"
+            routerwatch.init_db(db_path)
+            config = {
+                "monitor": {"display_timezone": "America/New_York"},
+                "devices": {
+                    "recent_minutes": 999999,
+                    "names": {"192.168.4.21": "Kitchen Display"},
+                },
+            }
+            device = {
+                "ip": "192.168.4.21",
+                "interface": "wlan0",
+                "mac": "7c:61:66:5b:32:a3",
+                "state": "STALE",
+                "hostname": None,
+            }
+
+            routerwatch.update_device_inventory(
+                db_path, config, [device], "2026-07-06T12:00:00+00:00"
+            )
+            routerwatch.update_device_inventory(
+                db_path, config, [device], "2026-07-06T12:01:00+00:00"
+            )
+
+            inventory = routerwatch.device_inventory(config, db_path)
+            self.assertEqual(1, len(inventory))
+            self.assertEqual("Kitchen Display", inventory[0]["friendly_name"])
+            self.assertEqual(2, inventory[0]["seen_count"])
+            self.assertEqual("recent", inventory[0]["status"])
 
 
 if __name__ == "__main__":
