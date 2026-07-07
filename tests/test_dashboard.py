@@ -32,6 +32,36 @@ def result(checked_at, healthy=True):
 
 
 class DashboardTest(unittest.TestCase):
+    def test_parse_ip_neigh_keeps_observed_ipv4_devices(self):
+        devices = routerwatch.parse_ip_neigh(
+            "\n".join(
+                [
+                    "192.168.1.1 dev eth0 lladdr 2e:67:be:3b:9e:b3 REACHABLE",
+                    "192.168.4.21 dev wlan0 lladdr 7c:61:66:5b:32:a3 STALE",
+                    "fe80::1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE",
+                    "192.168.1.80 dev eth0 FAILED",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "ip": "192.168.1.1",
+                    "interface": "eth0",
+                    "mac": "2e:67:be:3b:9e:b3",
+                    "state": "REACHABLE",
+                },
+                {
+                    "ip": "192.168.4.21",
+                    "interface": "wlan0",
+                    "mac": "7c:61:66:5b:32:a3",
+                    "state": "STALE",
+                },
+            ],
+            devices,
+        )
+
     def test_payload_includes_latest_metrics_and_recent_history(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "routerwatch.sqlite"

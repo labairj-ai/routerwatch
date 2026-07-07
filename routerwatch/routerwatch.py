@@ -472,6 +472,61 @@ def pending_alerts(db_path: Path) -> List[Dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def parse_ip_neigh(output: str) -> List[Dict[str, Optional[str]]]:
+    devices = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or "dev" not in parts:
+            continue
+        ip = parts[0]
+        if ":" in ip:
+            continue
+        dev_index = parts.index("dev")
+        interface = parts[dev_index + 1] if dev_index + 1 < len(parts) else None
+        mac = None
+        if "lladdr" in parts:
+            mac_index = parts.index("lladdr")
+            mac = parts[mac_index + 1] if mac_index + 1 < len(parts) else None
+        state = parts[-1] if parts[-1].isupper() else None
+        if state in {"FAILED", "INCOMPLETE"}:
+            continue
+        devices.append(
+            {
+                "ip": ip,
+                "interface": interface,
+                "mac": mac,
+                "state": state,
+            }
+        )
+    return devices
+
+
+def hostname_for_ip(ip: str) -> Optional[str]:
+    code, stdout, _ = run_command(["getent", "hosts", ip], timeout=2)
+    if code != 0:
+        return None
+    parts = stdout.split()
+    if len(parts) >= 2:
+        return parts[1]
+    return None
+
+
+def observed_devices() -> List[Dict[str, Optional[str]]]:
+    code, stdout, _ = run_command(["ip", "neigh", "show"], timeout=5)
+    if code != 0:
+        return []
+    devices = parse_ip_neigh(stdout)
+    for device in devices:
+        device["hostname"] = hostname_for_ip(device["ip"] or "")
+    return sorted(
+        devices,
+        key=lambda device: (
+            device.get("interface") or "",
+            device.get("ip") or "",
+        ),
+    )
+
+
 def outage_checks_before_recovery(db_path: Path) -> List[Dict[str, Any]]:
     outage = []
     with sqlite3.connect(db_path) as conn:
@@ -1212,6 +1267,7 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
         "thresholds": thresholds,
         "timeline": timeline,
         "recent_checks": recent,
+        "observed_devices": observed_devices(),
     }
 
 
@@ -1417,6 +1473,12 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
 
     <section>
+      <h2>Observed Local Devices</h2>
+      <div class="muted" style="margin-bottom:8px">Seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
+      <table><thead><tr><th>IP</th><th>Hostname</th><th>Interface</th><th>State</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
+    </section>
+
+    <section>
       <h2>Recent Checks</h2>
       <table><thead><tr><th>Time</th><th>Status</th><th>Latency</th><th>Loss</th><th>Notes</th></tr></thead><tbody id="recent"></tbody></table>
     </section>
@@ -1492,6 +1554,7 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
       document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
+      document.getElementById("devices").innerHTML = data.observed_devices.length ? data.observed_devices.map((d) => row([d.ip, d.hostname || "", d.interface, d.state, d.mac])).join("") : row(["No devices observed", "", "", "", ""]);
       document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
     }
     async function refresh() {
