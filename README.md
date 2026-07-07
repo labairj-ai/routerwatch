@@ -22,6 +22,8 @@ Gmail alerting uses the same OAuth pattern as DansbyTracker: `credentials.json` 
 - Outage start/end times
 - Failed degradation emails queued locally until connectivity returns
 - Router restart attempts triggered through a configurable command
+- Local read-only dashboard for current status, history, incidents, firmware,
+  and queued emails
 
 ## Project Layout
 
@@ -34,6 +36,8 @@ systemd/
   routerwatch.service     Run as a service on the Pi
   routerwatch.timer       Run every minute on the Pi
   routerwatch-weekly.*    Send the Saturday health report
+  routerwatch-dashboard.service
+                          Serve the local web dashboard
 ```
 
 Runtime files are intentionally ignored by git:
@@ -122,6 +126,23 @@ Send the weekly health report manually:
 SENDER_EMAIL=labairj@gmail.com ./venv/bin/python routerwatch/routerwatch.py weekly-report --config routerwatch/config.json
 ```
 
+Start the dashboard manually:
+
+```bash
+./venv/bin/python routerwatch/routerwatch.py dashboard --config routerwatch/config.json --host 0.0.0.0 --port 8765
+```
+
+Then open:
+
+```text
+http://gameserver.local:8765/
+```
+
+The dashboard is read-only. It shows the latest check, weekly and all-time
+health metrics, recent latency/loss, outages and degradations, router firmware,
+and pending queued emails. It refreshes itself every 30 seconds while the
+existing minute timer continues collecting data.
+
 The weekly report covers the preceding seven days and includes uptime, latency
 and packet-loss trends against the prior week, DNS failures, firmware changes,
 and the times and durations of outages or degradations. Its all-time section
@@ -191,8 +212,9 @@ sudo cp systemd/routerwatch.service /etc/systemd/system/
 sudo cp systemd/routerwatch.timer /etc/systemd/system/
 sudo cp systemd/routerwatch-weekly.service /etc/systemd/system/
 sudo cp systemd/routerwatch-weekly.timer /etc/systemd/system/
+sudo cp systemd/routerwatch-dashboard.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now routerwatch.timer routerwatch-weekly.timer
+sudo systemctl enable --now routerwatch.timer routerwatch-weekly.timer routerwatch-dashboard.service
 ```
 
 Check logs:
@@ -200,11 +222,25 @@ Check logs:
 ```bash
 journalctl -u routerwatch.service -n 100 --no-pager
 journalctl -u routerwatch-weekly.service -n 100 --no-pager
+journalctl -u routerwatch-dashboard.service -n 100 --no-pager
 ```
 
 The monitoring timer runs every minute. The weekly timer runs Saturday at
 6:00 AM `America/New_York`, including across daylight-saving changes. Both run
 in the background without an SSH session.
+
+The dashboard runs continuously at `http://gameserver.local:8765/` when
+`routerwatch-dashboard.service` is enabled.
+
+If you do not want to enter the Pi sudo password, the dashboard can run as the
+`labairj` user:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/routerwatch-dashboard.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now routerwatch-dashboard.service
+```
 
 ## Healthy Baseline
 

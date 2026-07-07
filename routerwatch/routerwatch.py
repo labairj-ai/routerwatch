@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape, unescape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -447,6 +448,27 @@ def recent_checks(db_path: Path, limit: int) -> List[Dict[str, Any]]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM checks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def recent_events(db_path: Path, limit: int) -> List[Dict[str, Any]]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def pending_alerts(db_path: Path) -> List[Dict[str, Any]]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, subject, kind, attempts, last_error
+            FROM alert_outbox
+            WHERE sent_at IS NULL
+            ORDER BY id
+            """
+        ).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -1045,6 +1067,400 @@ def weekly_report_content(
     return text, html
 
 
+def local_iso(value: str, config: Dict[str, Any]) -> str:
+    return parse_utc(value).astimezone(display_timezone(config)).isoformat(timespec="seconds")
+
+
+def local_display(value: str, config: Dict[str, Any]) -> str:
+    return parse_utc(value).astimezone(display_timezone(config)).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
+def row_healthy(row: Dict[str, Any]) -> bool:
+    return bool(row["gateway_ok"] and row["internet_ok"] and row["dns_ok"] and row["https_ok"])
+
+
+def row_needs_attention(row: Dict[str, Any]) -> bool:
+    notes = row.get("notes") or ""
+    return (not row_healthy(row)) or any(
+        marker in notes
+        for marker in ("high packet loss:", "high latency:", "weak Wi-Fi signal:")
+    )
+
+
+def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
+    init_db(db_path)
+    checks = recent_checks(db_path, 240)
+    latest = checks[0] if checks else None
+    analysis = health_analysis(config, db_path)
+    tz = display_timezone(config)
+
+    timeline = []
+    for row in reversed(checks[:120]):
+        timeline.append(
+            {
+                "checked_at": local_iso(row["checked_at"], config),
+                "label": parse_utc(row["checked_at"]).astimezone(tz).strftime("%I:%M %p"),
+                "healthy": row_healthy(row),
+                "needs_attention": row_needs_attention(row),
+                "latency_ms": row["avg_latency_ms"],
+                "packet_loss_percent": row["packet_loss_percent"],
+            }
+        )
+
+    recent = []
+    for row in checks[:30]:
+        recent.append(
+            {
+                "checked_at": local_display(row["checked_at"], config),
+                "status": "healthy" if not row_needs_attention(row) else "needs attention",
+                "gateway_ok": bool(row["gateway_ok"]),
+                "internet_ok": bool(row["internet_ok"]),
+                "dns_ok": bool(row["dns_ok"]),
+                "https_ok": bool(row["https_ok"]),
+                "latency_ms": row["avg_latency_ms"],
+                "packet_loss_percent": row["packet_loss_percent"],
+                "notes": row["notes"] or "",
+            }
+        )
+
+    weekly_episodes = []
+    for episode in analysis["weekly_episodes"][:20]:
+        start = episode["start"].astimezone(tz)
+        end = episode["end"].astimezone(tz)
+        weekly_episodes.append(
+            {
+                "kind": "outage" if episode["outage"] else "degradation",
+                "start": start.strftime("%a %Y-%m-%d %I:%M %p %Z"),
+                "end": end.strftime("%I:%M %p %Z"),
+                "duration": format_duration(episode["start"].isoformat(), episode["end"].isoformat()),
+            }
+        )
+
+    latest_payload = None
+    if latest:
+        latest_payload = {
+            "checked_at": local_display(latest["checked_at"], config),
+            "status": "healthy" if not row_needs_attention(latest) else "needs attention",
+            "healthy": row_healthy(latest),
+            "needs_attention": row_needs_attention(latest),
+            "gateway_ok": bool(latest["gateway_ok"]),
+            "internet_ok": bool(latest["internet_ok"]),
+            "dns_ok": bool(latest["dns_ok"]),
+            "https_ok": bool(latest["https_ok"]),
+            "latency_ms": latest["avg_latency_ms"],
+            "packet_loss_percent": latest["packet_loss_percent"],
+            "ethernet_operstate": latest.get("ethernet_operstate"),
+            "ethernet_speed_mbps": latest.get("ethernet_speed_mbps"),
+            "ethernet_duplex": latest.get("ethernet_duplex"),
+            "wifi_rssi_dbm": latest.get("wifi_rssi_dbm"),
+            "wifi_tx_bitrate": latest.get("wifi_tx_bitrate"),
+            "default_gateway": latest.get("default_gateway"),
+            "public_ip": latest.get("public_ip"),
+            "router_model": latest.get("router_model"),
+            "router_firmware_version": latest.get("router_firmware_version"),
+            "router_serial_number": latest.get("router_serial_number"),
+            "router_internet_status": latest.get("router_internet_status"),
+            "router_cloud_status": latest.get("router_cloud_status"),
+            "router_connected_pods": latest.get("router_connected_pods"),
+            "notes": latest["notes"] or "",
+        }
+
+    return {
+        "generated_at": utc_now().astimezone(tz).strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+        "router_name": config.get("router", {}).get("name", "Home Router"),
+        "latest": latest_payload,
+        "weekly": analysis["weekly"],
+        "prior": analysis["prior"],
+        "lifetime": analysis["lifetime"],
+        "weekly_episodes": weekly_episodes,
+        "lifetime_episode_count": analysis["lifetime_episode_count"],
+        "common_day": analysis["common_day"],
+        "common_hour": analysis["common_hour"],
+        "current_firmware": analysis["current_firmware"],
+        "weekly_firmware_changes": [
+            {
+                "at": local_display(change["at"], config),
+                "from": change["from"],
+                "to": change["to"],
+            }
+            for change in analysis["weekly_firmware_changes"]
+        ],
+        "pending_alerts": [
+            {
+                **alert,
+                "created_at": local_display(alert["created_at"], config),
+            }
+            for alert in pending_alerts(db_path)
+        ],
+        "events": [
+            {
+                **event,
+                "event_at": local_display(event["event_at"], config),
+            }
+            for event in recent_events(db_path, 20)
+        ],
+        "timeline": timeline,
+        "recent_checks": recent,
+    }
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RouterWatch Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #647084;
+      --line: #d9dee8;
+      --good: #177245;
+      --bad: #b42318;
+      --warn: #a15c07;
+      --blue: #2457a6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      background: #172033;
+      color: #fff;
+      padding: 18px 24px;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: 0; }
+    h2 { margin: 0 0 12px; font-size: 16px; }
+    main { max-width: 1280px; margin: 0 auto; padding: 20px; }
+    .muted { color: var(--muted); }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--muted); }
+    .good .dot { background: var(--good); }
+    .bad .dot { background: var(--bad); }
+    .grid { display: grid; gap: 16px; }
+    .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .two { grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr); }
+    section, .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .metric .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+    .metric .value { font-size: 26px; font-weight: 750; margin-top: 4px; }
+    .metric .sub { color: var(--muted); margin-top: 4px; min-height: 20px; }
+    .checks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+    .check {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px;
+      font-weight: 650;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .ok { color: var(--good); }
+    .fail { color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .timeline {
+      height: 180px;
+      display: flex;
+      align-items: end;
+      gap: 2px;
+      border-left: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 8px 0 0 8px;
+      overflow: hidden;
+    }
+    .bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; }
+    .bar.warn { background: var(--warn); }
+    .bar.bad { background: var(--bad); }
+    .details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; }
+    .details div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 6px 0; }
+    .details span:first-child { color: var(--muted); }
+    .notes { white-space: pre-wrap; color: var(--muted); }
+    @media (max-width: 900px) {
+      main { padding: 14px; }
+      .cards, .two, .checks, .details { grid-template-columns: 1fr; }
+      header { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="title">RouterWatch</h1>
+      <div class="muted" id="generated">Loading...</div>
+    </div>
+    <div class="status" id="status"><span class="dot"></span><span>Loading</span></div>
+  </header>
+  <main class="grid">
+    <section>
+      <h2>Current Check</h2>
+      <div id="latestLine" class="muted">Waiting for data.</div>
+      <div class="checks" id="checks"></div>
+    </section>
+
+    <div class="grid cards">
+      <div class="card metric"><div class="label">Weekly uptime</div><div class="value" id="weeklyUptime">N/A</div><div class="sub" id="weeklyChecks"></div></div>
+      <div class="card metric"><div class="label">Latency avg / p95</div><div class="value" id="latency">N/A</div><div class="sub" id="latencyWorst"></div></div>
+      <div class="card metric"><div class="label">Packet loss avg / worst</div><div class="value" id="loss">N/A</div><div class="sub" id="dns"></div></div>
+      <div class="card metric"><div class="label">All-time incidents</div><div class="value" id="incidents">N/A</div><div class="sub" id="common"></div></div>
+    </div>
+
+    <div class="grid two">
+      <section>
+        <h2>Recent Latency And Loss</h2>
+        <div class="timeline" id="timeline"></div>
+      </section>
+      <section>
+        <h2>Router Details</h2>
+        <div class="details" id="details"></div>
+      </section>
+    </div>
+
+    <div class="grid two">
+      <section>
+        <h2>Outages And Degradations This Week</h2>
+        <table><thead><tr><th>Type</th><th>Start</th><th>End</th><th>Duration</th></tr></thead><tbody id="episodes"></tbody></table>
+      </section>
+      <section>
+        <h2>Email Queue And Firmware</h2>
+        <div id="queue" class="muted"></div>
+        <div style="margin-top:12px" id="firmware" class="muted"></div>
+      </section>
+    </div>
+
+    <section>
+      <h2>Recent Checks</h2>
+      <table><thead><tr><th>Time</th><th>Status</th><th>Latency</th><th>Loss</th><th>Notes</th></tr></thead><tbody id="recent"></tbody></table>
+    </section>
+  </main>
+  <script>
+    const fmt = (value, suffix = "", digits = 2) => value === null || value === undefined ? "N/A" : Number(value).toFixed(digits) + suffix;
+    const text = (id, value) => { document.getElementById(id).textContent = value; };
+    const cell = (value) => String(value ?? "");
+    function row(values) {
+      return "<tr>" + values.map((value) => "<td>" + cell(value) + "</td>").join("") + "</tr>";
+    }
+    function render(data) {
+      text("title", data.router_name + " Dashboard");
+      text("generated", "Updated " + data.generated_at);
+      const status = document.getElementById("status");
+      status.className = "status " + (data.latest?.needs_attention ? "bad" : "good");
+      status.lastElementChild.textContent = data.latest?.status || "No data";
+      text("latestLine", data.latest ? data.latest.checked_at : "No checks recorded yet.");
+
+      const checkItems = [["Gateway", data.latest?.gateway_ok], ["Internet", data.latest?.internet_ok], ["DNS", data.latest?.dns_ok], ["HTTPS", data.latest?.https_ok]];
+      document.getElementById("checks").innerHTML = checkItems.map(([name, ok]) => `<div class="check"><span>${name}</span><span class="${ok ? "ok" : "fail"}">${ok ? "OK" : "Fail"}</span></div>`).join("");
+
+      text("weeklyUptime", fmt(data.weekly.uptime, "%", 3));
+      text("weeklyChecks", data.weekly.checks + " checks this week");
+      text("latency", fmt(data.weekly.latency_avg, " ms") + " / " + fmt(data.weekly.latency_p95, " ms"));
+      text("latencyWorst", "Worst " + fmt(data.weekly.latency_worst, " ms"));
+      text("loss", fmt(data.weekly.loss_avg, "%") + " / " + fmt(data.weekly.loss_worst, "%"));
+      text("dns", data.weekly.dns_failures + " DNS failures");
+      text("incidents", data.lifetime_episode_count);
+      const common = [data.common_day ? `${data.common_day[0]} (${data.common_day[1]})` : "no common day", data.common_hour ? `${data.common_hour[0]} (${data.common_hour[1]})` : "no common hour"].join(" · ");
+      text("common", common);
+
+      const bars = data.timeline.map((point) => {
+        const latency = point.latency_ms ?? 0;
+        const loss = point.packet_loss_percent ?? 0;
+        const height = Math.max(6, Math.min(100, latency * 2 + loss));
+        const cls = !point.healthy ? "bad" : point.needs_attention ? "warn" : "";
+        return `<div class="bar ${cls}" title="${point.label}: ${fmt(point.latency_ms, " ms")} latency, ${fmt(point.packet_loss_percent, "%")} loss" style="height:${height}%"></div>`;
+      }).join("");
+      document.getElementById("timeline").innerHTML = bars || "<div class='muted'>No timeline data yet.</div>";
+
+      const latest = data.latest || {};
+      const details = [
+        ["Model", latest.router_model], ["Firmware", latest.router_firmware_version || data.current_firmware],
+        ["Serial", latest.router_serial_number], ["Router internet", latest.router_internet_status],
+        ["Cloud", latest.router_cloud_status], ["Pods", latest.router_connected_pods],
+        ["Ethernet", [latest.ethernet_operstate, latest.ethernet_speed_mbps ? latest.ethernet_speed_mbps + " Mbps" : null, latest.ethernet_duplex].filter(Boolean).join(" / ")],
+        ["Wi-Fi", [latest.wifi_rssi_dbm ? latest.wifi_rssi_dbm + " dBm" : null, latest.wifi_tx_bitrate].filter(Boolean).join(" / ")],
+        ["Gateway", latest.default_gateway], ["Public IP", latest.public_ip]
+      ];
+      document.getElementById("details").innerHTML = details.map(([k, v]) => `<div><span>${k}</span><strong>${cell(v || "N/A")}</strong></div>`).join("");
+
+      document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
+      document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
+      document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
+      document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
+    }
+    async function refresh() {
+      const response = await fetch("/api/status", { cache: "no-store" });
+      if (!response.ok) throw new Error("status request failed");
+      render(await response.json());
+    }
+    refresh().catch((error) => {
+      text("generated", "Dashboard failed to load: " + error.message);
+    });
+    setInterval(() => refresh().catch(() => {}), 30000);
+  </script>
+</body>
+</html>
+"""
+
+
+def command_dashboard(config: Dict[str, Any], config_path: Path, host: str, port: int) -> int:
+    db_path = resolve_path(config_path, config["storage"].get("database_path", "routerwatch.sqlite"))
+    init_db(db_path)
+
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            log(config, config_path, "dashboard " + (format % args))
+
+        def send_content(self, status: int, content_type: str, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path in ("/", "/index.html"):
+                self.send_content(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
+                return
+            if self.path == "/api/status":
+                body = json.dumps(dashboard_payload(config, db_path), default=str).encode("utf-8")
+                self.send_content(200, "application/json; charset=utf-8", body)
+                return
+            self.send_content(404, "text/plain; charset=utf-8", b"Not found")
+
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
+    print(f"RouterWatch dashboard listening on http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
+    finally:
+        server.server_close()
+    return 0
+
+
 def should_alert(config: Dict[str, Any], db_path: Path, result: CheckResult) -> Tuple[bool, str]:
     if not config["alerts"].get("enabled", True):
         return False, "alerts disabled"
@@ -1286,10 +1702,13 @@ def main() -> int:
             "status",
             "send-test",
             "weekly-report",
+            "dashboard",
             "restart-router",
         ],
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
+    parser.add_argument("--host", default="0.0.0.0", help="Dashboard bind host")
+    parser.add_argument("--port", type=int, default=8765, help="Dashboard bind port")
     args = parser.parse_args()
 
     config_path = Path(args.config).expanduser().resolve()
@@ -1307,6 +1726,8 @@ def main() -> int:
         return command_send_test(config, config_path)
     if args.command == "weekly-report":
         return command_weekly_report(config, config_path)
+    if args.command == "dashboard":
+        return command_dashboard(config, config_path, args.host, args.port)
     if args.command == "restart-router":
         print(restart_router(config, db_path))
         return 0

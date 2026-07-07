@@ -1,0 +1,14 @@
+[Unit]
+Description=RouterWatch local dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/labairj/routerwatch
+ExecStart=/home/labairj/routerwatch/venv/bin/python /home/labairj/routerwatch/routerwatch/routerwatch.py dashboard --config /home/labairj/routerwatch/routerwatch/config.json --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
