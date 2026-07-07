@@ -1846,6 +1846,17 @@ DASHBOARD_HTML = """<!doctype html>
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .sort-button {
+      border: 0;
+      background: transparent;
+      color: inherit;
+      padding: 0;
+      font: inherit;
+      text-transform: inherit;
+      letter-spacing: inherit;
+      cursor: pointer;
+    }
+    .sort-button.active { color: var(--ink); }
     .chart-head {
       display: flex;
       align-items: baseline;
@@ -2012,7 +2023,19 @@ DASHBOARD_HTML = """<!doctype html>
         <button id="scanNow" type="button">Scan now</button>
         <span class="muted" id="scanStatus"></span>
       </div>
-      <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>IP</th><th>IP History</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
+      <table><thead><tr>
+        <th><button class="sort-button" data-sort="name" type="button">Name</button></th>
+        <th><button class="sort-button" data-sort="device_type" type="button">Type</button></th>
+        <th><button class="sort-button" data-sort="status" type="button">Status</button></th>
+        <th><button class="sort-button" data-sort="current_ip" type="button">IP</button></th>
+        <th><button class="sort-button" data-sort="ip_history_summary" type="button">IP History</button></th>
+        <th><button class="sort-button" data-sort="interface" type="button">Interface</button></th>
+        <th><button class="sort-button active" data-sort="last_seen_utc" type="button">Last Seen ↓</button></th>
+        <th><button class="sort-button" data-sort="first_seen_utc" type="button">First Seen</button></th>
+        <th><button class="sort-button" data-sort="seen_count" type="button">Seen</button></th>
+        <th><button class="sort-button" data-sort="vendor" type="button">Vendor</button></th>
+        <th><button class="sort-button" data-sort="mac" type="button">MAC</button></th>
+      </tr></thead><tbody id="devices"></tbody></table>
     </section>
 
     <section>
@@ -2035,6 +2058,7 @@ DASHBOARD_HTML = """<!doctype html>
       return "<tr>" + values.map((value) => "<td>" + cell(value) + "</td>").join("") + "</tr>";
     }
     let currentData = null;
+    let deviceSort = { key: "last_seen_utc", direction: "desc" };
     const filterIds = ["filterStatus", "filterVendor", "filterType", "filterSubnet"];
     function filterValue(id) {
       return document.getElementById(id)?.value || "";
@@ -2064,9 +2088,45 @@ DASHBOARD_HTML = """<!doctype html>
           && (!subnet || (d.subnet || "unknown") === subnet);
       });
     }
+    function ipSortValue(value) {
+      const parts = String(value || "").split(".").map((part) => Number(part));
+      return parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+        ? parts.reduce((acc, part) => acc * 256 + part, 0)
+        : -1;
+    }
+    function deviceSortValue(device, key) {
+      if (key === "name") return (device.friendly_name || device.hostname || "").toLowerCase();
+      if (key === "current_ip") return ipSortValue(device.current_ip);
+      if (key === "seen_count") return Number(device.seen_count || 0);
+      if (key === "last_seen_utc" || key === "first_seen_utc") return Date.parse(device[key] || "") || 0;
+      return String(device[key] || "").toLowerCase();
+    }
+    function sortedDevices(devices) {
+      const direction = deviceSort.direction === "asc" ? 1 : -1;
+      return [...devices].sort((a, b) => {
+        const av = deviceSortValue(a, deviceSort.key);
+        const bv = deviceSortValue(b, deviceSort.key);
+        if (av < bv) return -1 * direction;
+        if (av > bv) return 1 * direction;
+        return ipSortValue(a.current_ip) - ipSortValue(b.current_ip);
+      });
+    }
+    function updateSortButtons() {
+      document.querySelectorAll(".sort-button").forEach((button) => {
+        const label = button.textContent.replace(/[ ↑↓]+$/, "");
+        if (button.dataset.sort === deviceSort.key) {
+          button.classList.add("active");
+          button.textContent = label + (deviceSort.direction === "asc" ? " ↑" : " ↓");
+        } else {
+          button.classList.remove("active");
+          button.textContent = label;
+        }
+      });
+    }
     function renderDeviceTable() {
       if (!currentData) return;
-      const devices = filteredDevices(currentData.devices || []);
+      const devices = sortedDevices(filteredDevices(currentData.devices || []));
+      updateSortButtons();
       document.getElementById("devices").innerHTML = devices.length ? devices.map((d) => {
         const mac = (d.mac || "") + (d.locally_administered ? " (private)" : "");
         return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac]);
@@ -2178,6 +2238,18 @@ DASHBOARD_HTML = """<!doctype html>
     });
     document.addEventListener("click", (event) => {
       if (event.target && event.target.id === "scanNow") scanNow();
+      if (event.target && event.target.dataset && event.target.dataset.sort) {
+        const key = event.target.dataset.sort;
+        if (deviceSort.key === key) {
+          deviceSort.direction = deviceSort.direction === "asc" ? "desc" : "asc";
+        } else {
+          deviceSort = {
+            key,
+            direction: ["last_seen_utc", "first_seen_utc", "seen_count"].includes(key) ? "desc" : "asc",
+          };
+        }
+        renderDeviceTable();
+      }
     });
     refresh().catch((error) => {
       text("generated", "Dashboard failed to load: " + error.message);
