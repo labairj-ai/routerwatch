@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from email.mime.multipart import MIMEMultipart
@@ -30,6 +31,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 OUI_VENDOR_CACHE: Optional[Dict[str, str]] = None
 ACTIVE_SCAN_LAST_AT: Optional[float] = None
+
+
+@contextmanager
+def db_connect(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -325,7 +336,7 @@ def router_basic_info(config: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS checks (
@@ -449,7 +460,7 @@ def init_db(db_path: Path) -> None:
 
 
 def save_check(db_path: Path, result: CheckResult) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO checks (
@@ -488,7 +499,7 @@ def save_check(db_path: Path, result: CheckResult) -> None:
 
 
 def save_event(db_path: Path, event_type: str, details: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             "INSERT INTO events (event_at, event_type, details) VALUES (?, ?, ?)",
             (utc_iso(), event_type, details),
@@ -497,21 +508,21 @@ def save_event(db_path: Path, event_type: str, details: str) -> None:
 
 
 def recent_checks(db_path: Path, limit: int) -> List[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM checks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
 
 def recent_events(db_path: Path, limit: int) -> List[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
 
 def pending_alerts(db_path: Path) -> List[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -600,16 +611,25 @@ def scan_targets(config: Dict[str, Any]) -> List[str]:
     configured_subnets = devices_config.get("scan_subnets")
     max_hosts = int(devices_config.get("scan_max_hosts", 512))
     if configured_subnets:
-        networks = [ipaddress.ip_network(subnet, strict=False) for subnet in configured_subnets]
+        networks = []
+        for subnet in configured_subnets:
+            try:
+                networks.append(ipaddress.ip_network(subnet, strict=False))
+            except ValueError:
+                continue
     else:
         networks = local_ipv4_networks()
 
     targets = []
     for network in networks:
-        hosts = list(network.hosts())
-        if len(hosts) > max_hosts:
+        if not isinstance(network, ipaddress.IPv4Network):
             continue
-        targets.extend(str(host) for host in hosts)
+        usable_hosts = network.num_addresses
+        if network.prefixlen < 31:
+            usable_hosts = max(0, usable_hosts - 2)
+        if usable_hosts > max_hosts:
+            continue
+        targets.extend(str(host) for host in network.hosts())
     return sorted(set(targets), key=ipaddress.ip_address)
 
 
@@ -802,7 +822,7 @@ def update_device_inventory(
     seen_at: Optional[str] = None,
 ) -> None:
     seen_at = seen_at or utc_iso()
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         for device in devices:
             key = device_key(device)
             mac = normalize_mac(device.get("mac"))
@@ -893,7 +913,7 @@ def device_status(row: Dict[str, Any], now: datetime, config: Dict[str, Any]) ->
 
 
 def device_ip_history(config: Dict[str, Any], db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -914,7 +934,7 @@ def device_ip_history(config: Dict[str, Any], db_path: Path) -> Dict[str, List[D
 def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, Any]]:
     now = utc_now()
     ip_history = device_ip_history(config, db_path)
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -952,7 +972,7 @@ def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, An
 
 def outage_checks_before_recovery(db_path: Path) -> List[Dict[str, Any]]:
     outage = []
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM checks ORDER BY id DESC")
         next(rows, None)  # The current healthy check.
@@ -972,7 +992,7 @@ def outage_checks_before_recovery(db_path: Path) -> List[Dict[str, Any]]:
 
 
 def last_event(db_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM events WHERE event_type = ? ORDER BY id DESC LIMIT 1",
@@ -982,7 +1002,7 @@ def last_event(db_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
 
 
 def pending_alert(db_path: Path, kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         if kind:
             row = conn.execute(
@@ -1010,7 +1030,7 @@ def queue_alert(
 ) -> None:
     if pending_alert(db_path, kind):
         return
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO alert_outbox (
@@ -1023,7 +1043,7 @@ def queue_alert(
 
 
 def mark_alert_sent(db_path: Path, alert_id: int) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             UPDATE alert_outbox
@@ -1036,7 +1056,7 @@ def mark_alert_sent(db_path: Path, alert_id: int) -> None:
 
 
 def record_alert_retry_failure(db_path: Path, alert_id: int, error: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.execute(
             """
             UPDATE alert_outbox
@@ -1347,7 +1367,7 @@ def health_analysis(
     previous_firmware = None
     first_at = None
 
-    with sqlite3.connect(db_path) as conn:
+    with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -1618,7 +1638,7 @@ def refresh_device_inventory(
 
 def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
     init_db(db_path)
-    refresh_device_inventory(config, db_path)
+    update_device_inventory(db_path, config, inventory_devices(config))
     checks = recent_checks(db_path, 240)
     latest = checks[0] if checks else None
     analysis = health_analysis(config, db_path)
@@ -2003,7 +2023,14 @@ DASHBOARD_HTML = """<!doctype html>
   <script>
     const fmt = (value, suffix = "", digits = 2) => value === null || value === undefined ? "N/A" : Number(value).toFixed(digits) + suffix;
     const text = (id, value) => { document.getElementById(id).textContent = value; };
-    const cell = (value) => String(value ?? "");
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[char]));
+    const cell = (value) => esc(value);
     function row(values) {
       return "<tr>" + values.map((value) => "<td>" + cell(value) + "</td>").join("") + "</tr>";
     }
@@ -2016,7 +2043,7 @@ DASHBOARD_HTML = """<!doctype html>
       const select = document.getElementById(id);
       const previous = select.value;
       const options = ["", ...values.filter(Boolean).sort((a, b) => a.localeCompare(b))];
-      select.innerHTML = options.map((value) => `<option value="${value}">${value || "All"}</option>`).join("");
+      select.innerHTML = options.map((value) => `<option value="${esc(value)}">${esc(value || "All")}</option>`).join("");
       if (options.includes(previous)) select.value = previous;
     }
     function renderDeviceFilters(devices) {
@@ -2092,7 +2119,7 @@ DASHBOARD_HTML = """<!doctype html>
         const height = Math.max(6, Math.min(100, (latency - visualMinLatency) / visualRange * 100));
         const overThreshold = latency >= latencyThreshold || loss >= lossThreshold;
         const cls = !point.healthy ? "bad" : overThreshold || point.needs_attention ? "warn" : "";
-        return `<div class="bar ${cls}" title="${point.label}: ${fmt(point.latency_ms, " ms")} latency, ${fmt(point.packet_loss_percent, "%")} loss" style="height:${height}%"></div>`;
+        return `<div class="bar ${cls}" title="${esc(point.label)}: ${esc(fmt(point.latency_ms, " ms"))} latency, ${esc(fmt(point.packet_loss_percent, "%"))} loss" style="height:${height}%"></div>`;
       }).join("");
       document.getElementById("timeline").innerHTML = bars || "<div class='muted'>No timeline data yet.</div>";
 
@@ -2121,7 +2148,7 @@ DASHBOARD_HTML = """<!doctype html>
       ].map(([label, value]) => `<div><span>${label}</span><strong>${value ?? 0}</strong></div>`).join("");
       renderDeviceFilters(data.devices || []);
       renderDeviceTable();
-      document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
+      document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), r.notes || "No issues recorded."])).join("");
     }
     async function refresh() {
       const response = await fetch("/api/status", { cache: "no-store" });

@@ -66,7 +66,7 @@ class DashboardTest(unittest.TestCase):
     def test_scan_targets_respects_configured_subnets_and_host_cap(self):
         config = {
             "devices": {
-                "scan_subnets": ["192.168.1.0/30", "10.0.0.0/24"],
+                "scan_subnets": ["192.168.1.0/30", "10.0.0.0/24", "bad-subnet"],
                 "scan_max_hosts": 10,
             }
         }
