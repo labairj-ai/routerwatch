@@ -159,6 +159,7 @@ labels in `routerwatch/config.json`:
 ```json
 "devices": {
   "recent_minutes": 15,
+  "oui_path": "routerwatch/oui.txt",
   "names": {
     "2e:67:be:3b:9e:b3": "Spectrum Router",
     "192.168.4.21": "Kitchen Display"
@@ -178,6 +179,22 @@ labels in `routerwatch/config.json`:
     "2e:67:be:3b:9e:b3": "Spectrum"
   }
 }
+```
+
+To populate vendor names without entering the Pi sudo password, download the
+IEEE OUI file into the runtime path:
+
+```bash
+cd ~/routerwatch
+curl -fsSL https://standards-oui.ieee.org/oui/oui.txt -o routerwatch/oui.txt
+systemctl --user restart routerwatch-dashboard.service
+```
+
+Alternatively, install the system package if you are at the Pi terminal:
+
+```bash
+sudo apt update
+sudo apt install ieee-data
 ```
 
 The weekly report covers the preceding seven days and includes uptime, latency

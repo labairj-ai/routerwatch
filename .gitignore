@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 
 routerwatch/config.json
+routerwatch/oui.txt
 routerwatch.sqlite
 routerwatch.log
 *.log

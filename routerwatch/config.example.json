@@ -36,6 +36,7 @@
   },
   "devices": {
     "recent_minutes": 15,
+    "oui_path": "routerwatch/oui.txt",
     "names": {
       "2e:67:be:3b:9e:b3": "Spectrum Router"
     },

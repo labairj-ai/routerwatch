@@ -614,21 +614,44 @@ def configured_device_metadata(config: Dict[str, Any], device: Dict[str, Optiona
     }
 
 
-def load_oui_vendors() -> Dict[str, str]:
+def oui_paths(config: Dict[str, Any]) -> List[Path]:
+    configured_path = config.get("devices", {}).get("oui_path")
+    paths = []
+    if configured_path:
+        paths.append(Path(str(configured_path)).expanduser())
+    paths.extend(
+        [
+            Path("routerwatch/oui.txt"),
+            Path("/usr/share/ieee-data/oui.txt"),
+            Path("/var/lib/ieee-data/oui.txt"),
+            Path("/usr/share/misc/oui.txt"),
+        ]
+    )
+    return paths
+
+
+def load_oui_vendors(config: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     global OUI_VENDOR_CACHE
     if OUI_VENDOR_CACHE is not None:
         return OUI_VENDOR_CACHE
     vendors: Dict[str, str] = {}
-    for path in (
-        Path("/usr/share/ieee-data/oui.txt"),
-        Path("/var/lib/ieee-data/oui.txt"),
-        Path("/usr/share/misc/oui.txt"),
-    ):
+    for path in oui_paths(config or {}):
         if not path.exists():
             continue
         try:
             for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                match = re.match(r"^([0-9A-Fa-f]{2})[-:]?([0-9A-Fa-f]{2})[-:]?([0-9A-Fa-f]{2})\s+\(base 16\)\s+(.+)$", line)
+                match = re.match(
+                    r"^([0-9A-Fa-f]{2})[-:]?([0-9A-Fa-f]{2})[-:]?([0-9A-Fa-f]{2})\s+\(base 16\)\s+(.+)$",
+                    line,
+                )
+                if not match:
+                    match = re.match(
+                        r"^([0-9A-Fa-f]{6})\s+\(base 16\)\s+(.+)$",
+                        line,
+                    )
+                    if match:
+                        vendors[match.group(1).upper()] = match.group(2).strip()
+                        continue
                 if match:
                     vendors["".join(match.groups()[:3]).upper()] = match.group(4).strip()
         except OSError:
@@ -644,7 +667,7 @@ def device_vendor(config: Dict[str, Any], device: Dict[str, Optional[str]]) -> O
     if configured:
         return configured
     oui = normalize_oui(device.get("mac"))
-    return load_oui_vendors().get(oui or "")
+    return load_oui_vendors(config).get(oui or "")
 
 
 def is_locally_administered_mac(mac: Optional[str]) -> bool:
