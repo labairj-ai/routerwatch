@@ -42,6 +42,12 @@ class DashboardTest(unittest.TestCase):
             routerwatch.save_check(
                 db_path, result("2026-07-06T12:01:00+00:00", healthy=True)
             )
+            routerwatch.save_check(
+                db_path, result("2026-07-06T13:00:00+00:00", healthy=False)
+            )
+            routerwatch.save_check(
+                db_path, result("2026-07-06T13:01:00+00:00", healthy=True)
+            )
 
             payload = routerwatch.dashboard_payload(
                 {
@@ -58,12 +64,15 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual("Test Router", payload["router_name"])
             self.assertEqual("healthy", payload["latest"]["status"])
             self.assertEqual("SAX2V1R", payload["latest"]["router_model"])
-            self.assertEqual(2, payload["weekly"]["checks"])
-            self.assertEqual(2, len(payload["timeline"]))
-            self.assertEqual(2, len(payload["recent_checks"]))
-            self.assertEqual(1, payload["lifetime_episode_count"])
+            self.assertEqual(4, payload["weekly"]["checks"])
+            self.assertEqual(4, len(payload["timeline"]))
+            self.assertEqual(4, len(payload["recent_checks"]))
+            self.assertEqual(2, payload["lifetime_episode_count"])
             self.assertEqual(250, payload["thresholds"]["latency_alert_ms"])
             self.assertEqual(50, payload["thresholds"]["packet_loss_alert_percent"])
+            self.assertEqual(2, len(payload["weekly_episodes"]))
+            self.assertIn("09:00 AM", payload["weekly_episodes"][0]["start"])
+            self.assertIn("08:00 AM", payload["weekly_episodes"][1]["start"])
 
 
 if __name__ == "__main__":

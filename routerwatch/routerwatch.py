@@ -1129,7 +1129,12 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
         )
 
     weekly_episodes = []
-    for episode in analysis["weekly_episodes"][:20]:
+    newest_weekly_episodes = sorted(
+        analysis["weekly_episodes"],
+        key=lambda episode: episode["end"],
+        reverse=True,
+    )
+    for episode in newest_weekly_episodes[:20]:
         start = episode["start"].astimezone(tz)
         end = episode["end"].astimezone(tz)
         weekly_episodes.append(
