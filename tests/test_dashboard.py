@@ -146,6 +146,11 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(1, payload["device_summary"]["total"])
             self.assertEqual(1, payload["device_summary"]["active"])
             self.assertEqual(1, payload["device_summary"]["new_this_week"])
+            self.assertIn("outage_timeline", payload)
+            self.assertEqual([], payload["device_count_trend"])
+            timeline = routerwatch.outage_timeline(config, db_path, hours=48)
+            self.assertEqual(4, len(timeline))
+            self.assertIn(timeline[0]["status"], {"outage", "degraded", "healthy"})
 
     def test_device_inventory_updates_seen_count_and_ip_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -184,6 +189,29 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(2, len(inventory[0]["ip_history"]))
             self.assertIn("192.168.4.22", inventory[0]["ip_history_summary"])
             self.assertIn("192.168.4.21", inventory[0]["ip_history_summary"])
+
+    def test_device_snapshot_feeds_count_trend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "routerwatch.sqlite"
+            routerwatch.init_db(db_path)
+            config = {"monitor": {"display_timezone": "America/New_York"}}
+            routerwatch.save_device_snapshot(
+                db_path,
+                {
+                    "total": 10,
+                    "active": 8,
+                    "recent": 1,
+                    "offline": 1,
+                    "unknown_private": 2,
+                },
+                "2026-07-06T12:00:00+00:00",
+            )
+
+            trend = routerwatch.device_count_trend(config, db_path)
+
+            self.assertEqual(1, len(trend))
+            self.assertEqual(10, trend[0]["total"])
+            self.assertEqual(8, trend[0]["active"])
 
 
 if __name__ == "__main__":

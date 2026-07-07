@@ -456,6 +456,19 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_at TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                active INTEGER NOT NULL,
+                recent INTEGER NOT NULL,
+                offline INTEGER NOT NULL,
+                unknown_private INTEGER NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -1622,6 +1635,145 @@ def device_summary(devices: List[Dict[str, Any]]) -> Dict[str, int]:
     }
 
 
+def save_device_snapshot(db_path: Path, summary: Dict[str, int], snapshot_at: Optional[str] = None) -> None:
+    with db_connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO device_snapshots (
+                snapshot_at, total, active, recent, offline, unknown_private
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_at or utc_iso(),
+                int(summary.get("total", 0)),
+                int(summary.get("active", 0)),
+                int(summary.get("recent", 0)),
+                int(summary.get("offline", 0)),
+                int(summary.get("unknown_private", 0)),
+            ),
+        )
+        conn.commit()
+
+
+def device_count_trend(config: Dict[str, Any], db_path: Path, limit: int = 96) -> List[Dict[str, Any]]:
+    with db_connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT snapshot_at, total, active, recent, offline, unknown_private
+            FROM device_snapshots
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    trend = []
+    for raw in reversed(rows):
+        row = dict(raw)
+        trend.append(
+            {
+                "snapshot_at": local_iso(row["snapshot_at"], config),
+                "label": parse_utc(row["snapshot_at"]).astimezone(display_timezone(config)).strftime("%I:%M %p"),
+                "total": row["total"],
+                "active": row["active"],
+                "recent": row["recent"],
+                "offline": row["offline"],
+                "unknown_private": row["unknown_private"],
+            }
+        )
+    return trend
+
+
+def outage_timeline(config: Dict[str, Any], db_path: Path, hours: int = 24) -> List[Dict[str, Any]]:
+    since = utc_now() - timedelta(hours=hours)
+    with db_connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT checked_at, gateway_ok, internet_ok, dns_ok, https_ok,
+                   avg_latency_ms, packet_loss_percent, notes
+            FROM checks
+            WHERE checked_at >= ?
+            ORDER BY id
+            """,
+            (since.isoformat(timespec="seconds"),),
+        ).fetchall()
+    points = []
+    for raw in rows:
+        row = dict(raw)
+        healthy = row_healthy(row)
+        needs_attention = row_needs_attention(row)
+        points.append(
+            {
+                "checked_at": local_iso(row["checked_at"], config),
+                "label": parse_utc(row["checked_at"]).astimezone(display_timezone(config)).strftime("%I:%M %p"),
+                "status": "healthy" if not needs_attention else ("outage" if not healthy else "degraded"),
+                "healthy": healthy,
+                "needs_attention": needs_attention,
+                "latency_ms": row["avg_latency_ms"],
+                "packet_loss_percent": row["packet_loss_percent"],
+            }
+        )
+    return points
+
+
+def next_inventory_scan_time(config: Dict[str, Any], db_path: Path) -> Optional[str]:
+    def parse_systemd_time(value: str) -> Optional[str]:
+        value = value.strip()
+        if not value or value.lower() in {"n/a", "infinity", "-"}:
+            return None
+        for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(value, fmt)
+                if parsed.tzinfo is None:
+                    parsed = parsed.astimezone()
+                return parsed.astimezone(display_timezone(config)).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+            except ValueError:
+                continue
+        parts = value.split()
+        if len(parts) >= 4:
+            without_zone = " ".join(parts[:3])
+            try:
+                parsed = datetime.strptime(without_zone, "%a %Y-%m-%d %H:%M:%S").astimezone()
+                return parsed.astimezone(display_timezone(config)).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+            except ValueError:
+                pass
+        return None
+
+    code, stdout, _ = run_command(
+        ["systemctl", "--user", "is-active", "routerwatch-inventory-scan.service"],
+        timeout=5,
+    )
+    if code == 0 and stdout.strip() in {"active", "activating"}:
+        return "Scan running now"
+    code, stdout, _ = run_command(
+        ["systemctl", "--user", "show", "routerwatch-inventory-scan.timer", "--property=NextElapseUSecRealtime", "--value"],
+        timeout=5,
+    )
+    if code != 0:
+        return None
+    value = stdout.strip()
+    parsed_value = parse_systemd_time(value)
+    if parsed_value:
+        return parsed_value
+    code, stdout, _ = run_command(
+        ["systemctl", "--user", "list-timers", "routerwatch-inventory-scan.timer", "--no-pager", "--no-legend"],
+        timeout=5,
+    )
+    if code == 0:
+        parts = stdout.strip().split()
+        if len(parts) >= 4:
+            parsed_value = parse_systemd_time(" ".join(parts[:4]))
+            if parsed_value:
+                return parsed_value
+    interval = int(config.get("devices", {}).get("scan_interval_seconds", 300))
+    last = last_event(db_path, "inventory_scan")
+    if last:
+        next_at = parse_utc(last["event_at"]) + timedelta(seconds=interval)
+        return next_at.astimezone(display_timezone(config)).strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    return value or None
+
+
 def refresh_device_inventory(
     config: Dict[str, Any],
     db_path: Path,
@@ -1630,6 +1782,8 @@ def refresh_device_inventory(
     started = time.monotonic()
     devices = inventory_devices(config, active_scan=True, force_scan=force_scan)
     update_device_inventory(db_path, config, devices)
+    inventory = device_inventory(config, db_path)
+    save_device_snapshot(db_path, device_summary(inventory))
     return {
         "observed": len(devices),
         "duration_seconds": round(time.monotonic() - started, 2),
@@ -1765,6 +1919,9 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
         "recent_checks": recent,
         "devices": devices,
         "device_summary": device_summary(devices),
+        "device_count_trend": device_count_trend(config, db_path),
+        "outage_timeline": outage_timeline(config, db_path),
+        "next_inventory_scan": next_inventory_scan_time(config, db_path),
     }
 
 
@@ -1927,6 +2084,20 @@ DASHBOARD_HTML = """<!doctype html>
     .bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
     .bar.warn { background: var(--warn); }
     .bar.bad { background: var(--bad); }
+    .mini-chart {
+      height: 96px;
+      display: flex;
+      align-items: end;
+      gap: 2px;
+      border-left: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 8px 0 0 8px;
+      overflow: hidden;
+    }
+    .mini-bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
+    .mini-bar.good { background: var(--good); }
+    .mini-bar.warn { background: var(--warn); }
+    .mini-bar.bad { background: var(--bad); }
     .details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; }
     .details div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 6px 0; }
     .details span:first-child { color: var(--muted); }
@@ -2023,6 +2194,17 @@ DASHBOARD_HTML = """<!doctype html>
       </section>
     </div>
 
+    <div class="grid two">
+      <section>
+        <h2>Outage Timeline</h2>
+        <div class="mini-chart" id="outageTimeline"></div>
+      </section>
+      <section>
+        <h2>Device Count Trend</h2>
+        <div class="mini-chart" id="deviceTrend"></div>
+      </section>
+    </div>
+
     <section>
       <h2>Local Device Inventory</h2>
       <div class="muted" style="margin-bottom:8px">Persisted devices seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
@@ -2034,6 +2216,7 @@ DASHBOARD_HTML = """<!doctype html>
         <label>Subnet<select id="filterSubnet"></select></label>
         <button id="scanNow" type="button">Scan now</button>
         <span class="muted" id="scanStatus"></span>
+        <span class="muted" id="nextScan"></span>
       </div>
       <table><thead><tr>
         <th aria-sort="none"><button class="sort-button" data-sort="name" type="button"><span>Name</span><span class="sort-icon">↕</span></button></th>
@@ -2147,6 +2330,23 @@ DASHBOARD_HTML = """<!doctype html>
         return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac]);
       }).join("") : row(["No devices match filters", "", "", "", "", "", "", "", "", "", ""]);
     }
+    function renderOutageTimeline(points) {
+      const html = (points || []).map((point) => {
+        const cls = point.status === "outage" ? "bad" : point.status === "degraded" ? "warn" : "good";
+        const height = point.status === "outage" ? 100 : point.status === "degraded" ? 70 : 28;
+        return `<div class="mini-bar ${cls}" title="${esc(point.label)}: ${esc(point.status)}" style="height:${height}%"></div>`;
+      }).join("");
+      document.getElementById("outageTimeline").innerHTML = html || "<div class='muted'>No check history yet.</div>";
+    }
+    function renderDeviceTrend(points) {
+      const totals = (points || []).map((point) => Number(point.total || 0));
+      const maxTotal = Math.max(1, ...totals);
+      const html = (points || []).map((point) => {
+        const height = Math.max(6, Math.min(100, Number(point.total || 0) / maxTotal * 100));
+        return `<div class="mini-bar" title="${esc(point.label)}: ${esc(point.total)} total, ${esc(point.active)} active" style="height:${height}%"></div>`;
+      }).join("");
+      document.getElementById("deviceTrend").innerHTML = html || "<div class='muted'>No inventory snapshots yet.</div>";
+    }
     function render(data) {
       currentData = data;
       text("title", data.router_name + " Dashboard");
@@ -2212,6 +2412,8 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
       document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
+      renderOutageTimeline(data.outage_timeline || []);
+      renderDeviceTrend(data.device_count_trend || []);
       const summary = data.device_summary || {};
       document.getElementById("deviceSummary").innerHTML = [
         ["Total", summary.total],
@@ -2221,6 +2423,7 @@ DASHBOARD_HTML = """<!doctype html>
         ["Offline", summary.offline],
         ["Unknown/private", summary.unknown_private],
       ].map(([label, value]) => `<div><span>${label}</span><strong>${value ?? 0}</strong></div>`).join("");
+      text("nextScan", data.next_inventory_scan ? "Next scan: " + data.next_inventory_scan : "Next scan unavailable");
       renderDeviceFilters(data.devices || []);
       renderDeviceTable();
       document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), r.notes || "No issues recorded."])).join("");
