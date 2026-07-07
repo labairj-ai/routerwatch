@@ -153,8 +153,8 @@ RouterWatch can automatically pull or infer a limited amount of metadata:
 hostname from local name resolution, vendor from MAC OUI data if available on
 the Pi, private/randomized MAC detection, and conservative device-type guesses
 from hostname/vendor strings such as Roku, printer, camera, router, or TV
-brands. Exact device category, owner, and room are more reliable as manual
-labels in `routerwatch/config.json`:
+brands. Exact names and device categories are more reliable as manual labels in
+`routerwatch/config.json`:
 
 ```json
 "devices": {
@@ -167,13 +167,6 @@ labels in `routerwatch/config.json`:
   "types": {
     "2e:67:be:3b:9e:b3": "router",
     "192.168.4.21": "smart_display"
-  },
-  "owners": {
-    "192.168.4.21": "Home"
-  },
-  "locations": {
-    "2e:67:be:3b:9e:b3": "Network closet",
-    "192.168.4.21": "Kitchen"
   },
   "vendors": {
     "2e:67:be:3b:9e:b3": "Spectrum"

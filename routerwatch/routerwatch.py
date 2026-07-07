@@ -1826,7 +1826,7 @@ DASHBOARD_HTML = """<!doctype html>
     <section>
       <h2>Local Device Inventory</h2>
       <div class="muted" style="margin-bottom:8px">Persisted devices seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
-      <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>IP</th><th>IP History</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th><th>Owner</th><th>Location</th></tr></thead><tbody id="devices"></tbody></table>
+      <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>IP</th><th>IP History</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
     </section>
 
     <section>
@@ -1907,8 +1907,8 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
       document.getElementById("devices").innerHTML = data.devices.length ? data.devices.map((d) => {
         const mac = (d.mac || "") + (d.locally_administered ? " (private)" : "");
-        return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac, d.owner || "", d.location || ""]);
-      }).join("") : row(["No devices observed", "", "", "", "", "", "", "", "", "", "", "", ""]);
+        return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac]);
+      }).join("") : row(["No devices observed", "", "", "", "", "", "", "", "", "", ""]);
       document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
     }
     async function refresh() {
