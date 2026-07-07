@@ -145,9 +145,16 @@ seconds while the existing minute timer continues collecting data.
 
 The device inventory is based on what the Pi observes in the local neighbor
 table, not a Spectrum router-reported bandwidth list. It persists first seen,
-last seen, seen count, current IP, hostname when resolvable, MAC address,
-interface, state, status, and vendor when the Pi has local OUI data available.
-You can add friendly names in `routerwatch/config.json`:
+last seen, seen count, current IP, IP history, hostname when resolvable, MAC
+address, interface, state, status, vendor when the Pi has local OUI data
+available, and whether the MAC looks locally administered/private.
+
+RouterWatch can automatically pull or infer a limited amount of metadata:
+hostname from local name resolution, vendor from MAC OUI data if available on
+the Pi, private/randomized MAC detection, and conservative device-type guesses
+from hostname/vendor strings such as Roku, printer, camera, router, or TV
+brands. Exact device category, owner, and room are more reliable as manual
+labels in `routerwatch/config.json`:
 
 ```json
 "devices": {
@@ -155,6 +162,17 @@ You can add friendly names in `routerwatch/config.json`:
   "names": {
     "2e:67:be:3b:9e:b3": "Spectrum Router",
     "192.168.4.21": "Kitchen Display"
+  },
+  "types": {
+    "2e:67:be:3b:9e:b3": "router",
+    "192.168.4.21": "smart_display"
+  },
+  "owners": {
+    "192.168.4.21": "Home"
+  },
+  "locations": {
+    "2e:67:be:3b:9e:b3": "Network closet",
+    "192.168.4.21": "Kitchen"
   },
   "vendors": {
     "2e:67:be:3b:9e:b3": "Spectrum"

@@ -406,8 +406,39 @@ def init_db(db_path: Path) -> None:
                 mac TEXT,
                 vendor TEXT,
                 friendly_name TEXT,
+                device_type TEXT,
+                owner TEXT,
+                location TEXT,
+                metadata TEXT,
+                locally_administered INTEGER NOT NULL DEFAULT 0,
                 interface TEXT,
                 state TEXT
+            )
+            """
+        )
+        device_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        device_migrations = {
+            "device_type": "ALTER TABLE devices ADD COLUMN device_type TEXT",
+            "owner": "ALTER TABLE devices ADD COLUMN owner TEXT",
+            "location": "ALTER TABLE devices ADD COLUMN location TEXT",
+            "metadata": "ALTER TABLE devices ADD COLUMN metadata TEXT",
+            "locally_administered": "ALTER TABLE devices ADD COLUMN locally_administered INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, statement in device_migrations.items():
+            if column not in device_columns:
+                conn.execute(statement)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_ips (
+                device_key TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 0,
+                interface TEXT,
+                PRIMARY KEY (device_key, ip)
             )
             """
         )
@@ -574,6 +605,15 @@ def configured_device_value(config: Dict[str, Any], key: str, device: Dict[str, 
     return None
 
 
+def configured_device_metadata(config: Dict[str, Any], device: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    return {
+        "friendly_name": configured_device_value(config, "names", device),
+        "device_type": configured_device_value(config, "types", device),
+        "owner": configured_device_value(config, "owners", device),
+        "location": configured_device_value(config, "locations", device),
+    }
+
+
 def load_oui_vendors() -> Dict[str, str]:
     global OUI_VENDOR_CACHE
     if OUI_VENDOR_CACHE is not None:
@@ -607,6 +647,54 @@ def device_vendor(config: Dict[str, Any], device: Dict[str, Optional[str]]) -> O
     return load_oui_vendors().get(oui or "")
 
 
+def is_locally_administered_mac(mac: Optional[str]) -> bool:
+    normalized = normalize_mac(mac)
+    if not normalized:
+        return False
+    try:
+        first_octet = int(normalized.split(":")[0], 16)
+    except (IndexError, ValueError):
+        return False
+    return bool(first_octet & 0x02)
+
+
+def inferred_device_type(
+    device: Dict[str, Optional[str]],
+    vendor: Optional[str],
+    configured_type: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    signals = {
+        "hostname": device.get("hostname"),
+        "vendor": vendor,
+        "locally_administered_mac": is_locally_administered_mac(device.get("mac")),
+    }
+    if configured_type:
+        signals["type_source"] = "config"
+        return configured_type, signals
+
+    haystack = " ".join(
+        value.lower()
+        for value in (device.get("hostname"), vendor)
+        if value
+    )
+    type_rules = [
+        ("router", ("router", "gateway", "sax2")),
+        ("streaming_device", ("chromecast", "google cast", "apple tv", "fire tv")),
+        ("streaming_device", ("roku",)),
+        ("smart_tv", ("samsung", "vizio", "lg electronics", "bravia", "tcl")),
+        ("printer", ("printer", "brother", "canon", "epson", "hp inc")),
+        ("camera", ("camera", "ring", "arlo", "wyze", "nest cam")),
+        ("phone", ("iphone", "android", "pixel", "samsung")),
+        ("computer", ("macbook", "windows", "desktop", "laptop")),
+    ]
+    for device_type, markers in type_rules:
+        if any(marker in haystack for marker in markers):
+            signals["type_source"] = "inferred"
+            return device_type, signals
+    signals["type_source"] = "unknown"
+    return None, signals
+
+
 def device_key(device: Dict[str, Optional[str]]) -> str:
     mac = normalize_mac(device.get("mac"))
     if mac:
@@ -625,17 +713,24 @@ def update_device_inventory(
         for device in devices:
             key = device_key(device)
             mac = normalize_mac(device.get("mac"))
-            friendly_name = configured_device_value(config, "names", device)
+            configured = configured_device_metadata(config, device)
+            friendly_name = configured["friendly_name"]
             router = config.get("router", {})
             if not friendly_name and device.get("ip") == router.get("gateway"):
                 friendly_name = router.get("name", "Home Router")
             vendor = device_vendor(config, device)
+            device_type, metadata = inferred_device_type(
+                device, vendor, configured["device_type"]
+            )
+            metadata_json = json.dumps(metadata, sort_keys=True)
+            locally_administered = int(is_locally_administered_mac(mac))
             conn.execute(
                 """
                 INSERT INTO devices (
                     device_key, first_seen, last_seen, seen_count, current_ip,
-                    hostname, mac, vendor, friendly_name, interface, state
-                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                    hostname, mac, vendor, friendly_name, device_type, owner,
+                    location, metadata, locally_administered, interface, state
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_key) DO UPDATE SET
                     last_seen = excluded.last_seen,
                     seen_count = devices.seen_count + 1,
@@ -644,6 +739,11 @@ def update_device_inventory(
                     mac = COALESCE(excluded.mac, devices.mac),
                     vendor = COALESCE(excluded.vendor, devices.vendor),
                     friendly_name = COALESCE(excluded.friendly_name, devices.friendly_name),
+                    device_type = COALESCE(excluded.device_type, devices.device_type),
+                    owner = COALESCE(excluded.owner, devices.owner),
+                    location = COALESCE(excluded.location, devices.location),
+                    metadata = excluded.metadata,
+                    locally_administered = excluded.locally_administered,
                     interface = excluded.interface,
                     state = excluded.state
                 """,
@@ -656,8 +756,31 @@ def update_device_inventory(
                     mac,
                     vendor,
                     friendly_name,
+                    device_type,
+                    configured["owner"],
+                    configured["location"],
+                    metadata_json,
+                    locally_administered,
                     device.get("interface"),
                     device.get("state"),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO device_ips (
+                    device_key, ip, first_seen, last_seen, seen_count, interface
+                ) VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(device_key, ip) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    seen_count = device_ips.seen_count + 1,
+                    interface = excluded.interface
+                """,
+                (
+                    key,
+                    device.get("ip"),
+                    seen_at,
+                    seen_at,
+                    device.get("interface"),
                 ),
             )
         conn.commit()
@@ -676,14 +799,35 @@ def device_status(row: Dict[str, Any], now: datetime, config: Dict[str, Any]) ->
     return "observed"
 
 
+def device_ip_history(config: Dict[str, Any], db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT device_key, ip, first_seen, last_seen, seen_count, interface
+            FROM device_ips
+            ORDER BY last_seen DESC
+            """
+        ).fetchall()
+    history: Dict[str, List[Dict[str, Any]]] = {}
+    for raw in rows:
+        row = dict(raw)
+        row["first_seen"] = local_display(row["first_seen"], config)
+        row["last_seen"] = local_display(row["last_seen"], config)
+        history.setdefault(row["device_key"], []).append(row)
+    return history
+
+
 def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, Any]]:
     now = utc_now()
+    ip_history = device_ip_history(config, db_path)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             SELECT device_key, first_seen, last_seen, seen_count, current_ip,
-                   hostname, mac, vendor, friendly_name, interface, state
+                   hostname, mac, vendor, friendly_name, device_type, owner,
+                   location, metadata, locally_administered, interface, state
             FROM devices
             ORDER BY last_seen DESC, current_ip
             LIMIT 100
@@ -695,6 +839,17 @@ def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, An
         row["status"] = device_status(row, now, config)
         row["first_seen"] = local_display(row["first_seen"], config)
         row["last_seen"] = local_display(row["last_seen"], config)
+        row["ip_history"] = ip_history.get(row["device_key"], [])
+        row["ip_history_summary"] = ", ".join(
+            ip_row["ip"] for ip_row in row["ip_history"][:4]
+        )
+        if len(row["ip_history"]) > 4:
+            row["ip_history_summary"] += f" +{len(row['ip_history']) - 4} more"
+        try:
+            row["metadata"] = json.loads(row["metadata"] or "{}")
+        except json.JSONDecodeError:
+            row["metadata"] = {}
+        row["locally_administered"] = bool(row["locally_administered"])
         inventory.append(row)
     return inventory
 
@@ -1648,7 +1803,7 @@ DASHBOARD_HTML = """<!doctype html>
     <section>
       <h2>Local Device Inventory</h2>
       <div class="muted" style="margin-bottom:8px">Persisted devices seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
-      <table><thead><tr><th>Name</th><th>Status</th><th>IP</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
+      <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>IP</th><th>IP History</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th><th>Owner</th><th>Location</th></tr></thead><tbody id="devices"></tbody></table>
     </section>
 
     <section>
@@ -1727,7 +1882,10 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
       document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
-      document.getElementById("devices").innerHTML = data.devices.length ? data.devices.map((d) => row([d.friendly_name || d.hostname || "", d.status, d.current_ip, d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", d.mac])).join("") : row(["No devices observed", "", "", "", "", "", "", "", ""]);
+      document.getElementById("devices").innerHTML = data.devices.length ? data.devices.map((d) => {
+        const mac = (d.mac || "") + (d.locally_administered ? " (private)" : "");
+        return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac, d.owner || "", d.location || ""]);
+      }).join("") : row(["No devices observed", "", "", "", "", "", "", "", "", "", "", "", ""]);
       document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
     }
     async function refresh() {

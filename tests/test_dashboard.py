@@ -89,6 +89,9 @@ class DashboardTest(unittest.TestCase):
                 },
                 "devices": {
                     "names": {"2e:67:be:3b:9e:b3": "Spectrum Router"},
+                    "types": {"2e:67:be:3b:9e:b3": "router"},
+                    "owners": {"2e:67:be:3b:9e:b3": "ISP"},
+                    "locations": {"2e:67:be:3b:9e:b3": "Network closet"},
                     "vendors": {"2e:67:be:3b:9e:b3": "Spectrum"},
                 },
             }
@@ -121,10 +124,14 @@ class DashboardTest(unittest.TestCase):
             self.assertIn("08:00 AM", payload["weekly_episodes"][1]["start"])
             self.assertEqual(1, len(payload["devices"]))
             self.assertEqual("Spectrum Router", payload["devices"][0]["friendly_name"])
+            self.assertEqual("router", payload["devices"][0]["device_type"])
+            self.assertEqual("ISP", payload["devices"][0]["owner"])
+            self.assertEqual("Network closet", payload["devices"][0]["location"])
             self.assertEqual("Spectrum", payload["devices"][0]["vendor"])
             self.assertEqual(1, payload["devices"][0]["seen_count"])
+            self.assertEqual("192.168.1.1", payload["devices"][0]["ip_history_summary"])
 
-    def test_device_inventory_updates_seen_count(self):
+    def test_device_inventory_updates_seen_count_and_ip_history(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "routerwatch.sqlite"
             routerwatch.init_db(db_path)
@@ -138,14 +145,15 @@ class DashboardTest(unittest.TestCase):
             device = {
                 "ip": "192.168.4.21",
                 "interface": "wlan0",
-                "mac": "7c:61:66:5b:32:a3",
+                "mac": "ba:1e:49:4f:82:a5",
                 "state": "STALE",
-                "hostname": None,
+                "hostname": "roku-bedroom",
             }
 
             routerwatch.update_device_inventory(
                 db_path, config, [device], "2026-07-06T12:00:00+00:00"
             )
+            device["ip"] = "192.168.4.22"
             routerwatch.update_device_inventory(
                 db_path, config, [device], "2026-07-06T12:01:00+00:00"
             )
@@ -153,8 +161,13 @@ class DashboardTest(unittest.TestCase):
             inventory = routerwatch.device_inventory(config, db_path)
             self.assertEqual(1, len(inventory))
             self.assertEqual("Kitchen Display", inventory[0]["friendly_name"])
+            self.assertEqual("streaming_device", inventory[0]["device_type"])
             self.assertEqual(2, inventory[0]["seen_count"])
             self.assertEqual("recent", inventory[0]["status"])
+            self.assertTrue(inventory[0]["locally_administered"])
+            self.assertEqual(2, len(inventory[0]["ip_history"]))
+            self.assertIn("192.168.4.22", inventory[0]["ip_history_summary"])
+            self.assertIn("192.168.4.21", inventory[0]["ip_history_summary"])
 
 
 if __name__ == "__main__":
