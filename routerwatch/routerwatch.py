@@ -1329,17 +1329,20 @@ DASHBOARD_HTML = """<!doctype html>
       pointer-events: none;
       z-index: 0;
     }
-    .threshold-label {
+    .threshold-label,
+    .scale-label {
       position: absolute;
       right: 8px;
-      color: var(--good);
       font-size: 12px;
       background: rgba(255, 255, 255, .9);
       padding: 1px 5px;
       border-radius: 4px;
-      transform: translateY(50%);
       z-index: 2;
     }
+    .threshold-label { color: var(--good); transform: translateY(50%); }
+    .scale-label { color: var(--muted); }
+    .scale-label.top { top: 4px; }
+    .scale-label.bottom { bottom: 4px; }
     .bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
     .bar.warn { background: var(--warn); }
     .bar.bad { background: var(--bad); }
@@ -1385,6 +1388,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class="timeline-wrap">
           <div class="healthy-band" id="healthyBand"></div>
           <div class="threshold-label" id="thresholdLabel"></div>
+          <div class="scale-label top" id="scaleTop"></div>
+          <div class="scale-label bottom" id="scaleBottom"></div>
           <div class="timeline" id="timeline"></div>
         </div>
       </section>
@@ -1441,17 +1446,27 @@ DASHBOARD_HTML = """<!doctype html>
 
       const latencyThreshold = data.thresholds?.latency_alert_ms ?? 250;
       const lossThreshold = data.thresholds?.packet_loss_alert_percent ?? 50;
-      const observedMaxLatency = Math.max(0, ...data.timeline.map((point) => point.latency_ms ?? 0));
-      const latencyScaleMax = Math.max(latencyThreshold * 1.2, observedMaxLatency * 1.1, 1);
-      const bandHeight = Math.min(100, Math.max(0, latencyThreshold / latencyScaleMax * 100));
+      const latencyValues = data.timeline.map((point) => point.latency_ms).filter((value) => value !== null && value !== undefined).map(Number);
+      const observedMinLatency = latencyValues.length ? Math.min(...latencyValues) : 0;
+      const observedMaxLatency = latencyValues.length ? Math.max(...latencyValues) : latencyThreshold;
+      const observedRange = Math.max(1, observedMaxLatency - observedMinLatency);
+      const scalePadding = Math.max(2, observedRange * 0.25);
+      const visualMinLatency = Math.max(0, observedMinLatency - scalePadding);
+      const visualMaxLatency = Math.max(visualMinLatency + 1, observedMaxLatency + scalePadding);
+      const visualRange = visualMaxLatency - visualMinLatency;
+      const thresholdInView = latencyThreshold >= visualMinLatency && latencyThreshold <= visualMaxLatency;
+      const bandHeight = thresholdInView ? Math.min(100, Math.max(0, (latencyThreshold - visualMinLatency) / visualRange * 100)) : 100;
       document.getElementById("healthyBand").style.height = bandHeight + "%";
       document.getElementById("thresholdLabel").style.bottom = bandHeight + "%";
+      document.getElementById("thresholdLabel").style.display = thresholdInView ? "block" : "none";
       text("thresholdLabel", "< " + fmt(latencyThreshold, " ms", 0));
-      text("healthyLegend", "Healthy: latency < " + fmt(latencyThreshold, " ms", 0) + ", loss < " + fmt(lossThreshold, "%", 0));
+      text("scaleTop", fmt(visualMaxLatency, " ms", 0));
+      text("scaleBottom", fmt(visualMinLatency, " ms", 0));
+      text("healthyLegend", "Zoomed latency scale; healthy: < " + fmt(latencyThreshold, " ms", 0) + " and loss < " + fmt(lossThreshold, "%", 0));
       const bars = data.timeline.map((point) => {
         const latency = point.latency_ms ?? 0;
         const loss = point.packet_loss_percent ?? 0;
-        const height = Math.max(6, Math.min(100, latency / latencyScaleMax * 100));
+        const height = Math.max(6, Math.min(100, (latency - visualMinLatency) / visualRange * 100));
         const overThreshold = latency >= latencyThreshold || loss >= lossThreshold;
         const cls = !point.healthy ? "bad" : overThreshold || point.needs_attention ? "warn" : "";
         return `<div class="bar ${cls}" title="${point.label}: ${fmt(point.latency_ms, " ms")} latency, ${fmt(point.packet_loss_percent, "%")} loss" style="height:${height}%"></div>`;
