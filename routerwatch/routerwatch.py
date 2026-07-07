@@ -1855,8 +1855,20 @@ DASHBOARD_HTML = """<!doctype html>
       text-transform: inherit;
       letter-spacing: inherit;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
     }
     .sort-button.active { color: var(--ink); }
+    .sort-icon {
+      display: inline-block;
+      min-width: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1;
+    }
+    .sort-button.active .sort-icon { color: var(--blue); }
     .chart-head {
       display: flex;
       align-items: baseline;
@@ -2024,17 +2036,17 @@ DASHBOARD_HTML = """<!doctype html>
         <span class="muted" id="scanStatus"></span>
       </div>
       <table><thead><tr>
-        <th><button class="sort-button" data-sort="name" type="button">Name</button></th>
-        <th><button class="sort-button" data-sort="device_type" type="button">Type</button></th>
-        <th><button class="sort-button" data-sort="status" type="button">Status</button></th>
-        <th><button class="sort-button" data-sort="current_ip" type="button">IP</button></th>
-        <th><button class="sort-button" data-sort="ip_history_summary" type="button">IP History</button></th>
-        <th><button class="sort-button" data-sort="interface" type="button">Interface</button></th>
-        <th><button class="sort-button active" data-sort="last_seen_utc" type="button">Last Seen ↓</button></th>
-        <th><button class="sort-button" data-sort="first_seen_utc" type="button">First Seen</button></th>
-        <th><button class="sort-button" data-sort="seen_count" type="button">Seen</button></th>
-        <th><button class="sort-button" data-sort="vendor" type="button">Vendor</button></th>
-        <th><button class="sort-button" data-sort="mac" type="button">MAC</button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="name" type="button"><span>Name</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="device_type" type="button"><span>Type</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="status" type="button"><span>Status</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="current_ip" type="button"><span>IP</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="ip_history_summary" type="button"><span>IP History</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="interface" type="button"><span>Interface</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="descending"><button class="sort-button active" data-sort="last_seen_utc" type="button"><span>Last Seen</span><span class="sort-icon">↓</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="first_seen_utc" type="button"><span>First Seen</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="seen_count" type="button"><span>Seen</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="vendor" type="button"><span>Vendor</span><span class="sort-icon">↕</span></button></th>
+        <th aria-sort="none"><button class="sort-button" data-sort="mac" type="button"><span>MAC</span><span class="sort-icon">↕</span></button></th>
       </tr></thead><tbody id="devices"></tbody></table>
     </section>
 
@@ -2113,13 +2125,16 @@ DASHBOARD_HTML = """<!doctype html>
     }
     function updateSortButtons() {
       document.querySelectorAll(".sort-button").forEach((button) => {
-        const label = button.textContent.replace(/[ ↑↓]+$/, "");
+        const icon = button.querySelector(".sort-icon");
+        const header = button.closest("th");
         if (button.dataset.sort === deviceSort.key) {
           button.classList.add("active");
-          button.textContent = label + (deviceSort.direction === "asc" ? " ↑" : " ↓");
+          if (icon) icon.textContent = deviceSort.direction === "asc" ? "↑" : "↓";
+          if (header) header.setAttribute("aria-sort", deviceSort.direction === "asc" ? "ascending" : "descending");
         } else {
           button.classList.remove("active");
-          button.textContent = label;
+          if (icon) icon.textContent = "↕";
+          if (header) header.setAttribute("aria-sort", "none");
         }
       });
     }
