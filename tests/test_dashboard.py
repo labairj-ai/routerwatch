@@ -46,7 +46,11 @@ class DashboardTest(unittest.TestCase):
             payload = routerwatch.dashboard_payload(
                 {
                     "router": {"name": "Test Router"},
-                    "monitor": {"display_timezone": "America/New_York"},
+                    "monitor": {
+                        "display_timezone": "America/New_York",
+                        "latency_alert_ms": 250,
+                        "packet_loss_alert_percent": 50,
+                    },
                 },
                 db_path,
             )
@@ -58,6 +62,8 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(2, len(payload["timeline"]))
             self.assertEqual(2, len(payload["recent_checks"]))
             self.assertEqual(1, payload["lifetime_episode_count"])
+            self.assertEqual(250, payload["thresholds"]["latency_alert_ms"])
+            self.assertEqual(50, payload["thresholds"]["packet_loss_alert_percent"])
 
 
 if __name__ == "__main__":

@@ -1093,6 +1093,11 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
     latest = checks[0] if checks else None
     analysis = health_analysis(config, db_path)
     tz = display_timezone(config)
+    monitor = config.get("monitor", {})
+    thresholds = {
+        "latency_alert_ms": float(monitor.get("latency_alert_ms", 250)),
+        "packet_loss_alert_percent": float(monitor.get("packet_loss_alert_percent", 50)),
+    }
 
     timeline = []
     for row in reversed(checks[:120]):
@@ -1199,6 +1204,7 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
             }
             for event in recent_events(db_path, 20)
         ],
+        "thresholds": thresholds,
         "timeline": timeline,
         "recent_checks": recent,
     }
@@ -1282,6 +1288,25 @@ DASHBOARD_HTML = """<!doctype html>
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .chart-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .legend { color: var(--muted); font-size: 12px; }
+    .legend::before {
+      content: "";
+      display: inline-block;
+      width: 22px;
+      height: 10px;
+      margin-right: 6px;
+      background: rgba(23, 114, 69, .14);
+      border: 1px solid rgba(23, 114, 69, .35);
+      vertical-align: -1px;
+    }
+    .timeline-wrap { position: relative; }
     .timeline {
       height: 180px;
       display: flex;
@@ -1291,8 +1316,31 @@ DASHBOARD_HTML = """<!doctype html>
       border-bottom: 1px solid var(--line);
       padding: 8px 0 0 8px;
       overflow: hidden;
+      position: relative;
+      z-index: 1;
     }
-    .bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; }
+    .healthy-band {
+      position: absolute;
+      left: 1px;
+      right: 0;
+      bottom: 1px;
+      background: rgba(23, 114, 69, .14);
+      border-top: 1px solid rgba(23, 114, 69, .45);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .threshold-label {
+      position: absolute;
+      right: 8px;
+      color: var(--good);
+      font-size: 12px;
+      background: rgba(255, 255, 255, .9);
+      padding: 1px 5px;
+      border-radius: 4px;
+      transform: translateY(50%);
+      z-index: 2;
+    }
+    .bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
     .bar.warn { background: var(--warn); }
     .bar.bad { background: var(--bad); }
     .details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; }
@@ -1330,8 +1378,15 @@ DASHBOARD_HTML = """<!doctype html>
 
     <div class="grid two">
       <section>
-        <h2>Recent Latency And Loss</h2>
-        <div class="timeline" id="timeline"></div>
+        <div class="chart-head">
+          <h2>Recent Latency And Loss</h2>
+          <div class="legend" id="healthyLegend">Healthy range</div>
+        </div>
+        <div class="timeline-wrap">
+          <div class="healthy-band" id="healthyBand"></div>
+          <div class="threshold-label" id="thresholdLabel"></div>
+          <div class="timeline" id="timeline"></div>
+        </div>
       </section>
       <section>
         <h2>Router Details</h2>
@@ -1384,11 +1439,21 @@ DASHBOARD_HTML = """<!doctype html>
       const common = [data.common_day ? `${data.common_day[0]} (${data.common_day[1]})` : "no common day", data.common_hour ? `${data.common_hour[0]} (${data.common_hour[1]})` : "no common hour"].join(" · ");
       text("common", common);
 
+      const latencyThreshold = data.thresholds?.latency_alert_ms ?? 250;
+      const lossThreshold = data.thresholds?.packet_loss_alert_percent ?? 50;
+      const observedMaxLatency = Math.max(0, ...data.timeline.map((point) => point.latency_ms ?? 0));
+      const latencyScaleMax = Math.max(latencyThreshold * 1.2, observedMaxLatency * 1.1, 1);
+      const bandHeight = Math.min(100, Math.max(0, latencyThreshold / latencyScaleMax * 100));
+      document.getElementById("healthyBand").style.height = bandHeight + "%";
+      document.getElementById("thresholdLabel").style.bottom = bandHeight + "%";
+      text("thresholdLabel", "< " + fmt(latencyThreshold, " ms", 0));
+      text("healthyLegend", "Healthy: latency < " + fmt(latencyThreshold, " ms", 0) + ", loss < " + fmt(lossThreshold, "%", 0));
       const bars = data.timeline.map((point) => {
         const latency = point.latency_ms ?? 0;
         const loss = point.packet_loss_percent ?? 0;
-        const height = Math.max(6, Math.min(100, latency * 2 + loss));
-        const cls = !point.healthy ? "bad" : point.needs_attention ? "warn" : "";
+        const height = Math.max(6, Math.min(100, latency / latencyScaleMax * 100));
+        const overThreshold = latency >= latencyThreshold || loss >= lossThreshold;
+        const cls = !point.healthy ? "bad" : overThreshold || point.needs_attention ? "warn" : "";
         return `<div class="bar ${cls}" title="${point.label}: ${fmt(point.latency_ms, " ms")} latency, ${fmt(point.packet_loss_percent, "%")} loss" style="height:${height}%"></div>`;
       }).join("");
       document.getElementById("timeline").innerHTML = bars || "<div class='muted'>No timeline data yet.</div>";
