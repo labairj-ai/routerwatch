@@ -63,6 +63,19 @@ class DashboardTest(unittest.TestCase):
             devices,
         )
 
+    def test_scan_targets_respects_configured_subnets_and_host_cap(self):
+        config = {
+            "devices": {
+                "scan_subnets": ["192.168.1.0/30", "10.0.0.0/24"],
+                "scan_max_hosts": 10,
+            }
+        }
+
+        self.assertEqual(
+            ["192.168.1.1", "192.168.1.2"],
+            routerwatch.scan_targets(config),
+        )
+
     def test_payload_includes_latest_metrics_and_recent_history(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "routerwatch.sqlite"
@@ -97,7 +110,7 @@ class DashboardTest(unittest.TestCase):
             }
             with patch.object(
                 routerwatch,
-                "observed_devices",
+                "inventory_devices",
                 return_value=[
                     {
                         "ip": "192.168.1.1",

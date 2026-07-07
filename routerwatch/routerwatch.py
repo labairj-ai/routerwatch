@@ -2,6 +2,8 @@
 
 import argparse
 import base64
+import concurrent.futures
+import ipaddress
 import json
 import os
 import platform
@@ -27,6 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 OUI_VENDOR_CACHE: Optional[Dict[str, str]] = None
+ACTIVE_SCAN_LAST_AT: Optional[float] = None
 
 
 @dataclass
@@ -574,6 +577,69 @@ def observed_devices() -> List[Dict[str, Optional[str]]]:
             device.get("ip") or "",
         ),
     )
+
+
+def local_ipv4_networks() -> List[ipaddress.IPv4Network]:
+    code, stdout, _ = run_command(["ip", "-o", "-4", "addr", "show", "scope", "global"], timeout=5)
+    if code != 0:
+        return []
+    networks = []
+    for line in stdout.splitlines():
+        match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
+        if not match:
+            continue
+        try:
+            networks.append(ipaddress.ip_interface(match.group(1)).network)
+        except ValueError:
+            continue
+    return networks
+
+
+def scan_targets(config: Dict[str, Any]) -> List[str]:
+    devices_config = config.get("devices", {})
+    configured_subnets = devices_config.get("scan_subnets")
+    max_hosts = int(devices_config.get("scan_max_hosts", 512))
+    if configured_subnets:
+        networks = [ipaddress.ip_network(subnet, strict=False) for subnet in configured_subnets]
+    else:
+        networks = local_ipv4_networks()
+
+    targets = []
+    for network in networks:
+        hosts = list(network.hosts())
+        if len(hosts) > max_hosts:
+            continue
+        targets.extend(str(host) for host in hosts)
+    return sorted(set(targets), key=ipaddress.ip_address)
+
+
+def active_lan_scan(config: Dict[str, Any]) -> None:
+    global ACTIVE_SCAN_LAST_AT
+    devices_config = config.get("devices", {})
+    if not devices_config.get("active_scan_enabled", False):
+        return
+    interval = int(devices_config.get("scan_interval_seconds", 300))
+    now = time.monotonic()
+    if ACTIVE_SCAN_LAST_AT is not None and now - ACTIVE_SCAN_LAST_AT < interval:
+        return
+    ACTIVE_SCAN_LAST_AT = now
+    timeout = int(devices_config.get("scan_ping_timeout_seconds", 1))
+    concurrency = max(1, int(devices_config.get("scan_concurrency", 64)))
+    targets = scan_targets(config)
+    if not targets:
+        return
+
+    def ping_target(host: str) -> None:
+        run_command(["ping", "-c", "1", "-W", str(timeout), host], timeout=timeout + 1)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        list(executor.map(ping_target, targets))
+
+
+def inventory_devices(config: Dict[str, Any], active_scan: bool = False) -> List[Dict[str, Optional[str]]]:
+    if active_scan:
+        active_lan_scan(config)
+    return observed_devices()
 
 
 def normalize_mac(mac: Optional[str]) -> Optional[str]:
@@ -1494,7 +1560,7 @@ def row_needs_attention(row: Dict[str, Any]) -> bool:
 
 def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
     init_db(db_path)
-    update_device_inventory(db_path, config, observed_devices())
+    update_device_inventory(db_path, config, inventory_devices(config, active_scan=True))
     checks = recent_checks(db_path, 240)
     latest = checks[0] if checks else None
     analysis = health_analysis(config, db_path)
@@ -2084,7 +2150,12 @@ def command_check(config: Dict[str, Any], config_path: Path) -> int:
     init_db(db_path)
     result = perform_check(config)
     save_check(db_path, result)
-    update_device_inventory(db_path, config, observed_devices(), result.checked_at)
+    update_device_inventory(
+        db_path,
+        config,
+        inventory_devices(config, active_scan=bool(config.get("devices", {}).get("active_scan_on_check", False))),
+        result.checked_at,
+    )
     print(result_summary(result, config))
 
     maybe_send_pending_alert(config, config_path, db_path, result)

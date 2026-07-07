@@ -37,6 +37,13 @@
   "devices": {
     "recent_minutes": 15,
     "oui_path": "routerwatch/oui.txt",
+    "active_scan_enabled": true,
+    "scan_subnets": ["192.168.1.0/24", "192.168.4.0/22"],
+    "scan_max_hosts": 1024,
+    "scan_ping_timeout_seconds": 1,
+    "scan_concurrency": 64,
+    "scan_interval_seconds": 300,
+    "active_scan_on_check": false,
     "names": {
       "2e:67:be:3b:9e:b3": "Spectrum Router"
     },

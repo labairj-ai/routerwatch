@@ -144,10 +144,14 @@ pending queued emails, and local device inventory. It refreshes itself every 30
 seconds while the existing minute timer continues collecting data.
 
 The device inventory is based on what the Pi observes in the local neighbor
-table, not a Spectrum router-reported bandwidth list. It persists first seen,
-last seen, seen count, current IP, IP history, hostname when resolvable, MAC
-address, interface, state, status, vendor when the Pi has local OUI data
-available, and whether the MAC looks locally administered/private.
+table, not a Spectrum router-reported bandwidth list. When active scanning is
+enabled, RouterWatch briefly pings configured local subnets first, then reads
+the refreshed neighbor table. This discovers more reachable LAN/Wi-Fi devices,
+but it still does not show bandwidth usage or devices that ignore local probes.
+It persists first seen, last seen, seen count, current IP, IP history, hostname
+when resolvable, MAC address, interface, state, status, vendor when the Pi has
+local OUI data available, and whether the MAC looks locally
+administered/private.
 
 RouterWatch can automatically pull or infer a limited amount of metadata:
 hostname from local name resolution, vendor from MAC OUI data if available on
@@ -160,6 +164,13 @@ brands. Exact names and device categories are more reliable as manual labels in
 "devices": {
   "recent_minutes": 15,
   "oui_path": "routerwatch/oui.txt",
+  "active_scan_enabled": true,
+  "scan_subnets": ["192.168.1.0/24", "192.168.4.0/22"],
+  "scan_max_hosts": 1024,
+  "scan_ping_timeout_seconds": 1,
+  "scan_concurrency": 64,
+  "scan_interval_seconds": 300,
+  "active_scan_on_check": false,
   "names": {
     "2e:67:be:3b:9e:b3": "Spectrum Router",
     "192.168.4.21": "Kitchen Display"
