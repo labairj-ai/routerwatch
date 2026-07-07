@@ -613,14 +613,14 @@ def scan_targets(config: Dict[str, Any]) -> List[str]:
     return sorted(set(targets), key=ipaddress.ip_address)
 
 
-def active_lan_scan(config: Dict[str, Any]) -> None:
+def active_lan_scan(config: Dict[str, Any], force: bool = False) -> None:
     global ACTIVE_SCAN_LAST_AT
     devices_config = config.get("devices", {})
     if not devices_config.get("active_scan_enabled", False):
         return
     interval = int(devices_config.get("scan_interval_seconds", 300))
     now = time.monotonic()
-    if ACTIVE_SCAN_LAST_AT is not None and now - ACTIVE_SCAN_LAST_AT < interval:
+    if not force and ACTIVE_SCAN_LAST_AT is not None and now - ACTIVE_SCAN_LAST_AT < interval:
         return
     ACTIVE_SCAN_LAST_AT = now
     timeout = int(devices_config.get("scan_ping_timeout_seconds", 1))
@@ -636,9 +636,13 @@ def active_lan_scan(config: Dict[str, Any]) -> None:
         list(executor.map(ping_target, targets))
 
 
-def inventory_devices(config: Dict[str, Any], active_scan: bool = False) -> List[Dict[str, Optional[str]]]:
+def inventory_devices(
+    config: Dict[str, Any],
+    active_scan: bool = False,
+    force_scan: bool = False,
+) -> List[Dict[str, Optional[str]]]:
     if active_scan:
-        active_lan_scan(config)
+        active_lan_scan(config, force=force_scan)
     return observed_devices()
 
 
@@ -926,6 +930,8 @@ def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, An
     for raw in rows:
         row = dict(raw)
         row["status"] = device_status(row, now, config)
+        row["first_seen_utc"] = row["first_seen"]
+        row["last_seen_utc"] = row["last_seen"]
         row["first_seen"] = local_display(row["first_seen"], config)
         row["last_seen"] = local_display(row["last_seen"], config)
         row["ip_history"] = ip_history.get(row["device_key"], [])
@@ -939,6 +945,7 @@ def device_inventory(config: Dict[str, Any], db_path: Path) -> List[Dict[str, An
         except json.JSONDecodeError:
             row["metadata"] = {}
         row["locally_administered"] = bool(row["locally_administered"])
+        row["subnet"] = device_subnet(row.get("current_ip"))
         inventory.append(row)
     return inventory
 
@@ -1558,9 +1565,60 @@ def row_needs_attention(row: Dict[str, Any]) -> bool:
     )
 
 
+def device_subnet(ip: Optional[str]) -> str:
+    if not ip:
+        return "unknown"
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return "unknown"
+    if not isinstance(address, ipaddress.IPv4Address):
+        return "unknown"
+    parts = ip.split(".")
+    return ".".join(parts[:3]) + ".0/24"
+
+
+def device_summary(devices: List[Dict[str, Any]]) -> Dict[str, int]:
+    week_start = utc_now() - timedelta(days=7)
+    new_this_week = 0
+    for device in devices:
+        try:
+            first_seen = parse_utc(device.get("first_seen_utc") or "")
+        except (TypeError, ValueError):
+            continue
+        if first_seen >= week_start:
+            new_this_week += 1
+    return {
+        "total": len(devices),
+        "active": sum(1 for device in devices if device.get("status") == "active"),
+        "recent": sum(1 for device in devices if device.get("status") == "recent"),
+        "offline": sum(1 for device in devices if device.get("status") == "offline"),
+        "new_this_week": new_this_week,
+        "unknown_private": sum(
+            1
+            for device in devices
+            if device.get("locally_administered") or not device.get("vendor")
+        ),
+    }
+
+
+def refresh_device_inventory(
+    config: Dict[str, Any],
+    db_path: Path,
+    force_scan: bool = False,
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    devices = inventory_devices(config, active_scan=True, force_scan=force_scan)
+    update_device_inventory(db_path, config, devices)
+    return {
+        "observed": len(devices),
+        "duration_seconds": round(time.monotonic() - started, 2),
+    }
+
+
 def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
     init_db(db_path)
-    update_device_inventory(db_path, config, inventory_devices(config, active_scan=True))
+    refresh_device_inventory(config, db_path)
     checks = recent_checks(db_path, 240)
     latest = checks[0] if checks else None
     analysis = health_analysis(config, db_path)
@@ -1647,6 +1705,7 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
             "notes": latest["notes"] or "",
         }
 
+    devices = device_inventory(config, db_path)
     return {
         "generated_at": utc_now().astimezone(tz).strftime("%Y-%m-%d %I:%M:%S %p %Z"),
         "router_name": config.get("router", {}).get("name", "Home Router"),
@@ -1684,7 +1743,8 @@ def dashboard_payload(config: Dict[str, Any], db_path: Path) -> Dict[str, Any]:
         "thresholds": thresholds,
         "timeline": timeline,
         "recent_checks": recent,
-        "devices": device_inventory(config, db_path),
+        "devices": devices,
+        "device_summary": device_summary(devices),
     }
 
 
@@ -1828,9 +1888,40 @@ DASHBOARD_HTML = """<!doctype html>
     .details div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 6px 0; }
     .details span:first-child { color: var(--muted); }
     .notes { white-space: pre-wrap; color: var(--muted); }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+      margin: 12px 0;
+    }
+    .toolbar label { color: var(--muted); font-size: 12px; display: grid; gap: 3px; }
+    select, button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 7px 9px;
+      font: inherit;
+    }
+    button { cursor: pointer; font-weight: 650; }
+    button:disabled { cursor: wait; opacity: .65; }
+    .device-summary {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .device-summary div {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    .device-summary span { display: block; color: var(--muted); font-size: 12px; }
+    .device-summary strong { display: block; font-size: 20px; margin-top: 2px; }
     @media (max-width: 900px) {
       main { padding: 14px; }
-      .cards, .two, .checks, .details { grid-template-columns: 1fr; }
+      .cards, .two, .checks, .details, .device-summary { grid-template-columns: 1fr; }
       header { padding: 16px; }
     }
   </style>
@@ -1892,6 +1983,15 @@ DASHBOARD_HTML = """<!doctype html>
     <section>
       <h2>Local Device Inventory</h2>
       <div class="muted" style="margin-bottom:8px">Persisted devices seen by the Pi on local interfaces. This is presence data, not router-reported bandwidth usage.</div>
+      <div class="device-summary" id="deviceSummary"></div>
+      <div class="toolbar">
+        <label>Status<select id="filterStatus"></select></label>
+        <label>Vendor<select id="filterVendor"></select></label>
+        <label>Type<select id="filterType"></select></label>
+        <label>Subnet<select id="filterSubnet"></select></label>
+        <button id="scanNow" type="button">Scan now</button>
+        <span class="muted" id="scanStatus"></span>
+      </div>
       <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>IP</th><th>IP History</th><th>Interface</th><th>Last Seen</th><th>First Seen</th><th>Seen</th><th>Vendor</th><th>MAC</th></tr></thead><tbody id="devices"></tbody></table>
     </section>
 
@@ -1907,7 +2007,46 @@ DASHBOARD_HTML = """<!doctype html>
     function row(values) {
       return "<tr>" + values.map((value) => "<td>" + cell(value) + "</td>").join("") + "</tr>";
     }
+    let currentData = null;
+    const filterIds = ["filterStatus", "filterVendor", "filterType", "filterSubnet"];
+    function filterValue(id) {
+      return document.getElementById(id)?.value || "";
+    }
+    function setOptions(id, values) {
+      const select = document.getElementById(id);
+      const previous = select.value;
+      const options = ["", ...values.filter(Boolean).sort((a, b) => a.localeCompare(b))];
+      select.innerHTML = options.map((value) => `<option value="${value}">${value || "All"}</option>`).join("");
+      if (options.includes(previous)) select.value = previous;
+    }
+    function renderDeviceFilters(devices) {
+      setOptions("filterStatus", [...new Set(devices.map((d) => d.status || ""))]);
+      setOptions("filterVendor", [...new Set(devices.map((d) => d.vendor || "Unknown"))]);
+      setOptions("filterType", [...new Set(devices.map((d) => d.device_type || "Unknown"))]);
+      setOptions("filterSubnet", [...new Set(devices.map((d) => d.subnet || "unknown"))]);
+    }
+    function filteredDevices(devices) {
+      const status = filterValue("filterStatus");
+      const vendor = filterValue("filterVendor");
+      const type = filterValue("filterType");
+      const subnet = filterValue("filterSubnet");
+      return devices.filter((d) => {
+        return (!status || d.status === status)
+          && (!vendor || (d.vendor || "Unknown") === vendor)
+          && (!type || (d.device_type || "Unknown") === type)
+          && (!subnet || (d.subnet || "unknown") === subnet);
+      });
+    }
+    function renderDeviceTable() {
+      if (!currentData) return;
+      const devices = filteredDevices(currentData.devices || []);
+      document.getElementById("devices").innerHTML = devices.length ? devices.map((d) => {
+        const mac = (d.mac || "") + (d.locally_administered ? " (private)" : "");
+        return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac]);
+      }).join("") : row(["No devices match filters", "", "", "", "", "", "", "", "", "", ""]);
+    }
     function render(data) {
+      currentData = data;
       text("title", data.router_name + " Dashboard");
       text("generated", "Updated " + data.generated_at);
       const status = document.getElementById("status");
@@ -1971,10 +2110,17 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
       document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
-      document.getElementById("devices").innerHTML = data.devices.length ? data.devices.map((d) => {
-        const mac = (d.mac || "") + (d.locally_administered ? " (private)" : "");
-        return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac]);
-      }).join("") : row(["No devices observed", "", "", "", "", "", "", "", "", "", ""]);
+      const summary = data.device_summary || {};
+      document.getElementById("deviceSummary").innerHTML = [
+        ["Total", summary.total],
+        ["Active", summary.active],
+        ["Recent", summary.recent],
+        ["New this week", summary.new_this_week],
+        ["Offline", summary.offline],
+        ["Unknown/private", summary.unknown_private],
+      ].map(([label, value]) => `<div><span>${label}</span><strong>${value ?? 0}</strong></div>`).join("");
+      renderDeviceFilters(data.devices || []);
+      renderDeviceTable();
       document.getElementById("recent").innerHTML = data.recent_checks.map((r) => row([r.checked_at, r.status, fmt(r.latency_ms, " ms"), fmt(r.packet_loss_percent, "%"), `<span class="notes">${cell(r.notes || "No issues recorded.")}</span>`])).join("");
     }
     async function refresh() {
@@ -1982,6 +2128,30 @@ DASHBOARD_HTML = """<!doctype html>
       if (!response.ok) throw new Error("status request failed");
       render(await response.json());
     }
+    async function scanNow() {
+      const button = document.getElementById("scanNow");
+      button.disabled = true;
+      text("scanStatus", "Scanning...");
+      try {
+        const response = await fetch("/api/scan-now", { method: "POST", cache: "no-store" });
+        if (!response.ok) throw new Error("scan failed");
+        const result = await response.json();
+        text("scanStatus", `Found ${result.observed} observed devices in ${result.duration_seconds}s`);
+        await refresh();
+      } catch (error) {
+        text("scanStatus", error.message);
+      } finally {
+        button.disabled = false;
+      }
+    }
+    filterIds.forEach((id) => {
+      document.addEventListener("change", (event) => {
+        if (event.target && event.target.id === id) renderDeviceTable();
+      });
+    });
+    document.addEventListener("click", (event) => {
+      if (event.target && event.target.id === "scanNow") scanNow();
+    });
     refresh().catch((error) => {
       text("generated", "Dashboard failed to load: " + error.message);
     });
@@ -2014,6 +2184,14 @@ def command_dashboard(config: Dict[str, Any], config_path: Path, host: str, port
                 return
             if self.path == "/api/status":
                 body = json.dumps(dashboard_payload(config, db_path), default=str).encode("utf-8")
+                self.send_content(200, "application/json; charset=utf-8", body)
+                return
+            self.send_content(404, "text/plain; charset=utf-8", b"Not found")
+
+        def do_POST(self) -> None:
+            if self.path == "/api/scan-now":
+                result = refresh_device_inventory(config, db_path, force_scan=True)
+                body = json.dumps(result).encode("utf-8")
                 self.send_content(200, "application/json; charset=utf-8", body)
                 return
             self.send_content(404, "text/plain; charset=utf-8", b"Not found")
@@ -2266,6 +2444,24 @@ def command_weekly_report(config: Dict[str, Any], config_path: Path) -> int:
     return 0
 
 
+def command_inventory_scan(config: Dict[str, Any], config_path: Path) -> int:
+    db_path = resolve_path(config_path, config["storage"].get("database_path", "routerwatch.sqlite"))
+    init_db(db_path)
+    result = refresh_device_inventory(config, db_path, force_scan=True)
+    save_event(
+        db_path,
+        "inventory_scan",
+        f"observed={result['observed']} duration_seconds={result['duration_seconds']}",
+    )
+    log(
+        config,
+        config_path,
+        f"inventory scan observed={result['observed']} duration_seconds={result['duration_seconds']}",
+    )
+    print(f"Inventory scan observed {result['observed']} devices in {result['duration_seconds']}s.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Monitor home router and internet health.")
     parser.add_argument(
@@ -2276,6 +2472,7 @@ def main() -> int:
             "status",
             "send-test",
             "weekly-report",
+            "inventory-scan",
             "dashboard",
             "restart-router",
         ],
@@ -2300,6 +2497,8 @@ def main() -> int:
         return command_send_test(config, config_path)
     if args.command == "weekly-report":
         return command_weekly_report(config, config_path)
+    if args.command == "inventory-scan":
+        return command_inventory_scan(config, config_path)
     if args.command == "dashboard":
         return command_dashboard(config, config_path, args.host, args.port)
     if args.command == "restart-router":

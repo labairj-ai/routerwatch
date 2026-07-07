@@ -143,6 +143,9 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual("Spectrum", payload["devices"][0]["vendor"])
             self.assertEqual(1, payload["devices"][0]["seen_count"])
             self.assertEqual("192.168.1.1", payload["devices"][0]["ip_history_summary"])
+            self.assertEqual(1, payload["device_summary"]["total"])
+            self.assertEqual(1, payload["device_summary"]["active"])
+            self.assertEqual(1, payload["device_summary"]["new_this_week"])
 
     def test_device_inventory_updates_seen_count_and_ip_history(self):
         with tempfile.TemporaryDirectory() as directory:

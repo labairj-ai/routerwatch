@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh RouterWatch local device inventory
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/labairj/routerwatch
+ExecStart=/home/labairj/routerwatch/venv/bin/python /home/labairj/routerwatch/routerwatch/routerwatch.py inventory-scan --config /home/labairj/routerwatch/routerwatch/config.json
+
+[Install]
+WantedBy=default.target

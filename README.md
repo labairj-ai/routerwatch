@@ -36,6 +36,8 @@ systemd/
   routerwatch.service     Run as a service on the Pi
   routerwatch.timer       Run every minute on the Pi
   routerwatch-weekly.*    Send the Saturday health report
+  routerwatch-inventory-scan.*
+                          Refresh local device inventory
   routerwatch-dashboard.service
                           Serve the local web dashboard
 ```
@@ -141,7 +143,9 @@ http://gameserver.local:8765/
 The dashboard is read-only. It shows the latest check, weekly and all-time
 health metrics, recent latency/loss, outages and degradations, router firmware,
 pending queued emails, and local device inventory. It refreshes itself every 30
-seconds while the existing minute timer continues collecting data.
+seconds while the existing minute timer continues collecting data. The device
+inventory section includes compact counts, filters for status/vendor/type/subnet,
+and a manual scan button.
 
 The device inventory is based on what the Pi observes in the local neighbor
 table, not a Spectrum router-reported bandwidth list. When active scanning is
@@ -270,9 +274,11 @@ sudo cp systemd/routerwatch.service /etc/systemd/system/
 sudo cp systemd/routerwatch.timer /etc/systemd/system/
 sudo cp systemd/routerwatch-weekly.service /etc/systemd/system/
 sudo cp systemd/routerwatch-weekly.timer /etc/systemd/system/
+sudo cp systemd/routerwatch-inventory-scan.service /etc/systemd/system/
+sudo cp systemd/routerwatch-inventory-scan.timer /etc/systemd/system/
 sudo cp systemd/routerwatch-dashboard.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now routerwatch.timer routerwatch-weekly.timer routerwatch-dashboard.service
+sudo systemctl enable --now routerwatch.timer routerwatch-weekly.timer routerwatch-inventory-scan.timer routerwatch-dashboard.service
 ```
 
 Check logs:
@@ -280,6 +286,7 @@ Check logs:
 ```bash
 journalctl -u routerwatch.service -n 100 --no-pager
 journalctl -u routerwatch-weekly.service -n 100 --no-pager
+journalctl -u routerwatch-inventory-scan.service -n 100 --no-pager
 journalctl -u routerwatch-dashboard.service -n 100 --no-pager
 ```
 
@@ -296,8 +303,10 @@ If you do not want to enter the Pi sudo password, the dashboard can run as the
 ```bash
 mkdir -p ~/.config/systemd/user
 cp systemd/routerwatch-dashboard.service ~/.config/systemd/user/
+cp systemd/routerwatch-inventory-scan.service ~/.config/systemd/user/
+cp systemd/routerwatch-inventory-scan.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now routerwatch-dashboard.service
+systemctl --user enable --now routerwatch-dashboard.service routerwatch-inventory-scan.timer
 ```
 
 ## Healthy Baseline

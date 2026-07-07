@@ -1,0 +1,12 @@
+[Unit]
+Description=Run RouterWatch local device inventory scan every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=routerwatch-inventory-scan.service
+
+[Install]
+WantedBy=timers.target
