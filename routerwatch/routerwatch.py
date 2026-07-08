@@ -2094,11 +2094,7 @@ DASHBOARD_HTML = """<!doctype html>
       padding: 8px 0 0 8px;
       overflow: hidden;
     }
-    .outage-chart { height: 112px; }
     .mini-bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
-    .mini-bar.good { background: var(--good); }
-    .mini-bar.warn { background: var(--warn); }
-    .mini-bar.bad { background: var(--bad); }
     .timeline-legend {
       display: flex;
       gap: 10px;
@@ -2116,6 +2112,7 @@ DASHBOARD_HTML = """<!doctype html>
     .legend-swatch.good { background: var(--good); }
     .legend-swatch.warn { background: var(--warn); }
     .legend-swatch.bad { background: var(--bad); }
+    .legend-swatch.latency { background: var(--blue); }
     .timeline-summary {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2205,9 +2202,15 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="grid two">
       <section>
         <div class="chart-head">
-          <h2>Recent Latency And Loss</h2>
-          <div class="legend" id="healthyLegend">Healthy range</div>
+          <h2>Recent Latency, Loss, And Incidents</h2>
+          <div class="timeline-legend" aria-label="Timeline legend">
+            <span class="legend-key"><span class="legend-swatch latency"></span>Healthy latency</span>
+            <span class="legend-key"><span class="legend-swatch warn"></span>Degraded</span>
+            <span class="legend-key"><span class="legend-swatch bad"></span>Outage</span>
+          </div>
         </div>
+        <div class="legend" id="healthyLegend">Healthy range</div>
+        <div class="timeline-summary" id="timelineSummary"></div>
         <div class="timeline-wrap">
           <div class="healthy-band" id="healthyBand"></div>
           <div class="threshold-label" id="thresholdLabel"></div>
@@ -2215,6 +2218,7 @@ DASHBOARD_HTML = """<!doctype html>
           <div class="scale-label bottom" id="scaleBottom"></div>
           <div class="timeline" id="timeline"></div>
         </div>
+        <div class="timeline-axis"><span id="timelineStartLabel">Oldest</span><span>Most recent / now</span></div>
       </section>
       <section>
         <h2>Router Details</h2>
@@ -2234,20 +2238,7 @@ DASHBOARD_HTML = """<!doctype html>
       </section>
     </div>
 
-    <div class="grid two">
-      <section>
-        <div class="chart-head">
-          <h2>Outage Timeline</h2>
-          <div class="timeline-legend" aria-label="Timeline legend">
-            <span class="legend-key"><span class="legend-swatch good"></span>Healthy</span>
-            <span class="legend-key"><span class="legend-swatch warn"></span>Degraded</span>
-            <span class="legend-key"><span class="legend-swatch bad"></span>Outage</span>
-          </div>
-        </div>
-        <div class="timeline-summary" id="outageSummary"></div>
-        <div class="mini-chart outage-chart" id="outageTimeline"></div>
-        <div class="timeline-axis"><span id="outageStartLabel">Oldest</span><span>Most recent / now</span></div>
-      </section>
+    <div class="grid">
       <section>
         <h2>Device Count Trend</h2>
         <div class="mini-chart" id="deviceTrend"></div>
@@ -2379,64 +2370,37 @@ DASHBOARD_HTML = """<!doctype html>
         return row([d.friendly_name || d.hostname || "", d.device_type || "", d.status, d.current_ip, d.ip_history_summary || "", d.interface, d.last_seen, d.first_seen, d.seen_count, d.vendor || "", mac]);
       }).join("") : row(["No devices match filters", "", "", "", "", "", "", "", "", "", ""]);
     }
-    function renderOutageTimeline(points) {
+    function pointStatus(point) {
+      if (!point.healthy) return "outage";
+      if (point.needs_attention) return "degraded";
+      return "healthy";
+    }
+    function renderTimelineSummary(points) {
       const source = points || [];
-      const summaryEl = document.getElementById("outageSummary");
-      const startEl = document.getElementById("outageStartLabel");
+      const summaryEl = document.getElementById("timelineSummary");
+      const startEl = document.getElementById("timelineStartLabel");
       if (!source.length) {
         summaryEl.innerHTML = "";
         startEl.textContent = "Oldest";
-        document.getElementById("outageTimeline").innerHTML = "<div class='muted'>No check history yet.</div>";
         return;
       }
 
-      const statusRank = { healthy: 0, degraded: 1, outage: 2 };
-      const statusClass = { healthy: "good", degraded: "warn", outage: "bad" };
       const statusLabel = { healthy: "Healthy", degraded: "Degraded", outage: "Outage" };
       const counts = source.reduce((acc, point) => {
-        acc[point.status] = (acc[point.status] || 0) + 1;
+        const status = pointStatus(point);
+        acc[status] = (acc[status] || 0) + 1;
         return acc;
       }, { healthy: 0, degraded: 0, outage: 0 });
       const issueCount = counts.degraded + counts.outage;
       const healthyPercent = source.length ? Math.round(counts.healthy / source.length * 1000) / 10 : 0;
-      const lastIssue = [...source].reverse().find((point) => point.status !== "healthy");
+      const lastIssue = [...source].reverse().find((point) => pointStatus(point) !== "healthy");
       summaryEl.innerHTML = [
         ["Window", `${source[0].label} to now`],
         ["Healthy checks", `${healthyPercent}% (${counts.healthy}/${source.length})`],
         ["Issues", issueCount ? `${counts.outage} outage / ${counts.degraded} degraded` : "None"],
-        ["Last issue", lastIssue ? `${statusLabel[lastIssue.status]} at ${lastIssue.label}` : "None in window"],
+        ["Last issue", lastIssue ? `${statusLabel[pointStatus(lastIssue)]} at ${lastIssue.label}` : "None in window"],
       ].map(([label, value]) => `<div><span>${label}</span><strong>${esc(value)}</strong></div>`).join("");
       startEl.textContent = source[0].label + " / oldest";
-
-      const maxBuckets = 72;
-      const bucketSize = Math.max(1, Math.ceil(source.length / maxBuckets));
-      const buckets = [];
-      for (let i = 0; i < source.length; i += bucketSize) {
-        const items = source.slice(i, i + bucketSize);
-        const worst = items.reduce((current, point) => statusRank[point.status] > statusRank[current.status] ? point : current, items[0]);
-        const bucketCounts = items.reduce((acc, point) => {
-          acc[point.status] = (acc[point.status] || 0) + 1;
-          return acc;
-        }, { healthy: 0, degraded: 0, outage: 0 });
-        buckets.push({ items, worst, counts: bucketCounts });
-      }
-      const html = buckets.map((bucket) => {
-        const status = bucket.worst.status;
-        const cls = statusClass[status] || "good";
-        const height = status === "outage" ? 100 : status === "degraded" ? 68 : 24;
-        const first = bucket.items[0];
-        const last = bucket.items[bucket.items.length - 1];
-        const bucketWorstLoss = Math.max(0, ...bucket.items.map((point) => Number(point.packet_loss_percent || 0)));
-        const bucketWorstLatency = Math.max(0, ...bucket.items.map((point) => Number(point.latency_ms || 0)));
-        const title = [
-          `${first.label} to ${last.label}`,
-          `Worst: ${statusLabel[status]}`,
-          `${bucket.counts.outage} outage, ${bucket.counts.degraded} degraded, ${bucket.counts.healthy} healthy checks`,
-          `Worst in block: ${fmt(bucketWorstLatency, " ms", 0)} latency, ${fmt(bucketWorstLoss, "%", 0)} loss`
-        ].join("\\n");
-        return `<div class="mini-bar ${cls}" title="${esc(title)}" style="height:${height}%"></div>`;
-      }).join("");
-      document.getElementById("outageTimeline").innerHTML = html || "<div class='muted'>No check history yet.</div>";
     }
     function renderDeviceTrend(points) {
       const totals = (points || []).map((point) => Number(point.total || 0));
@@ -2488,13 +2452,21 @@ DASHBOARD_HTML = """<!doctype html>
       text("scaleTop", fmt(visualMaxLatency, " ms", 0));
       text("scaleBottom", fmt(visualMinLatency, " ms", 0));
       text("healthyLegend", "Zoomed latency scale; healthy: < " + fmt(latencyThreshold, " ms", 0) + " and loss < " + fmt(lossThreshold, "%", 0));
+      renderTimelineSummary(data.timeline || []);
+      const statusLabel = { healthy: "Healthy", degraded: "Degraded", outage: "Outage" };
       const bars = data.timeline.map((point) => {
         const latency = point.latency_ms ?? 0;
         const loss = point.packet_loss_percent ?? 0;
         const height = Math.max(6, Math.min(100, (latency - visualMinLatency) / visualRange * 100));
-        const overThreshold = latency >= latencyThreshold || loss >= lossThreshold;
-        const cls = !point.healthy ? "bad" : overThreshold || point.needs_attention ? "warn" : "";
-        return `<div class="bar ${cls}" title="${esc(point.label)}: ${esc(fmt(point.latency_ms, " ms"))} latency, ${esc(fmt(point.packet_loss_percent, "%"))} loss" style="height:${height}%"></div>`;
+        const status = pointStatus(point);
+        const cls = status === "outage" ? "bad" : status === "degraded" ? "warn" : "";
+        const title = [
+          point.label,
+          statusLabel[status],
+          fmt(point.latency_ms, " ms") + " latency",
+          fmt(point.packet_loss_percent, "%") + " packet loss"
+        ].join("\\n");
+        return `<div class="bar ${cls}" title="${esc(title)}" style="height:${height}%"></div>`;
       }).join("");
       document.getElementById("timeline").innerHTML = bars || "<div class='muted'>No timeline data yet.</div>";
 
@@ -2512,7 +2484,6 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById("episodes").innerHTML = data.weekly_episodes.length ? data.weekly_episodes.map((e) => row([e.kind, e.start, e.end, e.duration])).join("") : row(["None recorded", "", "", ""]);
       document.getElementById("queue").textContent = data.pending_alerts.length ? data.pending_alerts.map((a) => `${a.kind}: ${a.subject} (${a.attempts} attempts)`).join("\\n") : "No pending email alerts.";
       document.getElementById("firmware").textContent = data.weekly_firmware_changes.length ? data.weekly_firmware_changes.map((f) => `${f.at}: ${f.from} -> ${f.to}`).join("\\n") : "No firmware changes this week. Current: " + (data.current_firmware || "unknown");
-      renderOutageTimeline(data.outage_timeline || []);
       renderDeviceTrend(data.device_count_trend || []);
       const summary = data.device_summary || {};
       document.getElementById("deviceSummary").innerHTML = [
