@@ -33,6 +33,18 @@ OUI_VENDOR_CACHE: Optional[Dict[str, str]] = None
 ACTIVE_SCAN_LAST_AT: Optional[float] = None
 
 
+FAVICON_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#172033"/>
+  <path d="M16 40h32a4 4 0 0 1 4 4v4a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4v-4a4 4 0 0 1 4-4Z" fill="#2457a6"/>
+  <path d="M22 34a14 14 0 0 1 20 0" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M14 27a26 26 0 0 1 36 0" fill="none" stroke="#ffffff" stroke-opacity=".72" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="22" cy="46" r="2.5" fill="#ffffff"/>
+  <circle cx="32" cy="46" r="2.5" fill="#ffffff"/>
+  <path d="M41 45.5l4 4 8-9" fill="none" stroke="#35c46f" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+"""
+
+
 @contextmanager
 def db_connect(db_path: Path):
     conn = sqlite3.connect(db_path)
@@ -1931,6 +1943,7 @@ DASHBOARD_HTML = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RouterWatch Dashboard</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     :root {
       color-scheme: light;
@@ -2569,6 +2582,9 @@ def command_dashboard(config: Dict[str, Any], config_path: Path, host: str, port
         def do_GET(self) -> None:
             if self.path in ("/", "/index.html"):
                 self.send_content(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
+                return
+            if self.path in ("/favicon.svg", "/favicon.ico"):
+                self.send_content(200, "image/svg+xml", FAVICON_SVG)
                 return
             if self.path == "/api/status":
                 body = json.dumps(dashboard_payload(config, db_path), default=str).encode("utf-8")
