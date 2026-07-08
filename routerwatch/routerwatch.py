@@ -1667,25 +1667,43 @@ def save_device_snapshot(db_path: Path, summary: Dict[str, int], snapshot_at: Op
         conn.commit()
 
 
-def device_count_trend(config: Dict[str, Any], db_path: Path, limit: int = 96) -> List[Dict[str, Any]]:
+def device_count_trend(config: Dict[str, Any], db_path: Path, days: int = 90) -> List[Dict[str, Any]]:
+    since = utc_now() - timedelta(days=days)
+    tz = display_timezone(config)
     with db_connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             SELECT snapshot_at, total, active, recent, offline, unknown_private
             FROM device_snapshots
-            ORDER BY id DESC
-            LIMIT ?
+            WHERE snapshot_at >= ?
+            ORDER BY snapshot_at ASC, id ASC
             """,
-            (limit,),
+            (since.isoformat(timespec="seconds"),),
         ).fetchall()
-    trend = []
-    for raw in reversed(rows):
+    daily: Dict[str, Dict[str, Any]] = {}
+    for raw in rows:
         row = dict(raw)
+        local_snapshot = parse_utc(row["snapshot_at"]).astimezone(tz)
+        day_key = local_snapshot.strftime("%Y-%m-%d")
+        daily[day_key] = {
+            "snapshot_at": local_snapshot.isoformat(timespec="seconds"),
+            "label": f"{local_snapshot:%b} {local_snapshot.day}",
+            "day": day_key,
+            "total": row["total"],
+            "active": row["active"],
+            "recent": row["recent"],
+            "offline": row["offline"],
+            "unknown_private": row["unknown_private"],
+        }
+    trend = []
+    for day in sorted(daily):
+        row = daily[day]
         trend.append(
             {
-                "snapshot_at": local_iso(row["snapshot_at"], config),
-                "label": parse_utc(row["snapshot_at"]).astimezone(display_timezone(config)).strftime("%I:%M %p"),
+                "snapshot_at": row["snapshot_at"],
+                "label": row["label"],
+                "day": row["day"],
                 "total": row["total"],
                 "active": row["active"],
                 "recent": row["recent"],
@@ -2108,6 +2126,19 @@ DASHBOARD_HTML = """<!doctype html>
       overflow: hidden;
     }
     .mini-bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
+    .line-chart {
+      width: 100%;
+      height: 180px;
+      display: block;
+      border-left: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      overflow: visible;
+    }
+    .line-chart .grid-line { stroke: var(--line); stroke-width: 1; }
+    .line-chart .total-line { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .line-chart .active-line { fill: none; stroke: var(--good); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .line-chart .point { stroke: #fff; stroke-width: 2; }
+    .line-chart .label { fill: var(--muted); font-size: 11px; }
     .timeline-legend {
       display: flex;
       gap: 10px;
@@ -2126,6 +2157,7 @@ DASHBOARD_HTML = """<!doctype html>
     .legend-swatch.warn { background: var(--warn); }
     .legend-swatch.bad { background: var(--bad); }
     .legend-swatch.latency { background: var(--blue); }
+    .legend-swatch.total { background: var(--blue); }
     .timeline-summary {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2253,8 +2285,14 @@ DASHBOARD_HTML = """<!doctype html>
 
     <div class="grid">
       <section>
-        <h2>Device Count Trend</h2>
-        <div class="mini-chart" id="deviceTrend"></div>
+        <div class="chart-head">
+          <h2>Daily Device Count Trend</h2>
+          <div class="timeline-legend" aria-label="Device trend legend">
+            <span class="legend-key"><span class="legend-swatch total"></span>Total</span>
+            <span class="legend-key"><span class="legend-swatch good"></span>Active</span>
+          </div>
+        </div>
+        <div id="deviceTrend"></div>
       </section>
     </div>
 
@@ -2416,13 +2454,50 @@ DASHBOARD_HTML = """<!doctype html>
       startEl.textContent = source[0].label + " / oldest";
     }
     function renderDeviceTrend(points) {
-      const totals = (points || []).map((point) => Number(point.total || 0));
-      const maxTotal = Math.max(1, ...totals);
-      const html = (points || []).map((point) => {
-        const height = Math.max(6, Math.min(100, Number(point.total || 0) / maxTotal * 100));
-        return `<div class="mini-bar" title="${esc(point.label)}: ${esc(point.total)} total, ${esc(point.active)} active" style="height:${height}%"></div>`;
+      const source = points || [];
+      if (!source.length) {
+        document.getElementById("deviceTrend").innerHTML = "<div class='muted'>No inventory snapshots yet.</div>";
+        return;
+      }
+      const width = 760;
+      const height = 180;
+      const pad = { top: 14, right: 18, bottom: 28, left: 36 };
+      const values = source.flatMap((point) => [Number(point.total || 0), Number(point.active || 0)]);
+      const maxValue = Math.max(1, ...values);
+      const minValue = Math.min(0, ...values);
+      const range = Math.max(1, maxValue - minValue);
+      const x = (index) => source.length === 1
+        ? (pad.left + width - pad.right) / 2
+        : pad.left + index * ((width - pad.left - pad.right) / (source.length - 1));
+      const y = (value) => height - pad.bottom - ((Number(value || 0) - minValue) / range) * (height - pad.top - pad.bottom);
+      const line = (key) => source.map((point, index) => `${x(index).toFixed(1)},${y(point[key]).toFixed(1)}`).join(" ");
+      const pointsMarkup = source.map((point, index) => {
+        const cx = x(index).toFixed(1);
+        const totalY = y(point.total).toFixed(1);
+        const activeY = y(point.active).toFixed(1);
+        const title = `${point.label}: ${point.total} total, ${point.active} active, ${point.offline} offline`;
+        return [
+          `<circle class="point" cx="${cx}" cy="${totalY}" r="4" fill="#2457a6"><title>${esc(title)}</title></circle>`,
+          `<circle class="point" cx="${cx}" cy="${activeY}" r="4" fill="#177245"><title>${esc(title)}</title></circle>`,
+        ].join("");
       }).join("");
-      document.getElementById("deviceTrend").innerHTML = html || "<div class='muted'>No inventory snapshots yet.</div>";
+      const firstLabel = source[0].label;
+      const lastLabel = source[source.length - 1].label;
+      const midpoint = Math.round((maxValue + minValue) / 2);
+      document.getElementById("deviceTrend").innerHTML = `
+        <svg class="line-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Daily device count trend">
+          <line class="grid-line" x1="${pad.left}" y1="${y(maxValue).toFixed(1)}" x2="${width - pad.right}" y2="${y(maxValue).toFixed(1)}"></line>
+          <line class="grid-line" x1="${pad.left}" y1="${y(midpoint).toFixed(1)}" x2="${width - pad.right}" y2="${y(midpoint).toFixed(1)}"></line>
+          <line class="grid-line" x1="${pad.left}" y1="${y(minValue).toFixed(1)}" x2="${width - pad.right}" y2="${y(minValue).toFixed(1)}"></line>
+          <text class="label" x="4" y="${y(maxValue).toFixed(1)}">${esc(maxValue)}</text>
+          <text class="label" x="4" y="${y(midpoint).toFixed(1)}">${esc(midpoint)}</text>
+          <text class="label" x="4" y="${y(minValue).toFixed(1)}">${esc(minValue)}</text>
+          <polyline class="total-line" points="${line("total")}"></polyline>
+          <polyline class="active-line" points="${line("active")}"></polyline>
+          ${pointsMarkup}
+          <text class="label" x="${pad.left}" y="${height - 6}">${esc(firstLabel)}</text>
+          <text class="label" text-anchor="end" x="${width - pad.right}" y="${height - 6}">${esc(lastLabel)}</text>
+        </svg>`;
     }
     function render(data) {
       currentData = data;

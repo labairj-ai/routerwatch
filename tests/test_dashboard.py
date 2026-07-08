@@ -206,12 +206,38 @@ class DashboardTest(unittest.TestCase):
                 },
                 "2026-07-06T12:00:00+00:00",
             )
+            routerwatch.save_device_snapshot(
+                db_path,
+                {
+                    "total": 12,
+                    "active": 9,
+                    "recent": 2,
+                    "offline": 1,
+                    "unknown_private": 3,
+                },
+                "2026-07-06T18:00:00+00:00",
+            )
+            routerwatch.save_device_snapshot(
+                db_path,
+                {
+                    "total": 11,
+                    "active": 7,
+                    "recent": 2,
+                    "offline": 2,
+                    "unknown_private": 4,
+                },
+                "2026-07-07T12:00:00+00:00",
+            )
 
-            trend = routerwatch.device_count_trend(config, db_path)
+            trend = routerwatch.device_count_trend(config, db_path, days=3650)
 
-            self.assertEqual(1, len(trend))
-            self.assertEqual(10, trend[0]["total"])
-            self.assertEqual(8, trend[0]["active"])
+            self.assertEqual(2, len(trend))
+            self.assertEqual("2026-07-06", trend[0]["day"])
+            self.assertEqual(12, trend[0]["total"])
+            self.assertEqual(9, trend[0]["active"])
+            self.assertEqual("2026-07-07", trend[1]["day"])
+            self.assertEqual(11, trend[1]["total"])
+            self.assertEqual(7, trend[1]["active"])
 
 
 if __name__ == "__main__":
