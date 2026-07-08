@@ -2094,10 +2094,50 @@ DASHBOARD_HTML = """<!doctype html>
       padding: 8px 0 0 8px;
       overflow: hidden;
     }
+    .outage-chart { height: 112px; }
     .mini-bar { flex: 1 1 4px; min-width: 3px; background: var(--blue); border-radius: 3px 3px 0 0; opacity: .9; }
     .mini-bar.good { background: var(--good); }
     .mini-bar.warn { background: var(--warn); }
     .mini-bar.bad { background: var(--bad); }
+    .timeline-legend {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend-key { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      display: inline-block;
+    }
+    .legend-swatch.good { background: var(--good); }
+    .legend-swatch.warn { background: var(--warn); }
+    .legend-swatch.bad { background: var(--bad); }
+    .timeline-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin: 8px 0 10px;
+    }
+    .timeline-summary div {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      min-height: 54px;
+    }
+    .timeline-summary span { display: block; color: var(--muted); font-size: 12px; }
+    .timeline-summary strong { display: block; margin-top: 3px; font-size: 15px; }
+    .timeline-axis {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 6px;
+    }
     .details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; }
     .details div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 6px 0; }
     .details span:first-child { color: var(--muted); }
@@ -2135,7 +2175,7 @@ DASHBOARD_HTML = """<!doctype html>
     .device-summary strong { display: block; font-size: 20px; margin-top: 2px; }
     @media (max-width: 900px) {
       main { padding: 14px; }
-      .cards, .two, .checks, .details, .device-summary { grid-template-columns: 1fr; }
+      .cards, .two, .checks, .details, .device-summary, .timeline-summary { grid-template-columns: 1fr; }
       header { padding: 16px; }
     }
   </style>
@@ -2196,8 +2236,17 @@ DASHBOARD_HTML = """<!doctype html>
 
     <div class="grid two">
       <section>
-        <h2>Outage Timeline</h2>
-        <div class="mini-chart" id="outageTimeline"></div>
+        <div class="chart-head">
+          <h2>Outage Timeline</h2>
+          <div class="timeline-legend" aria-label="Timeline legend">
+            <span class="legend-key"><span class="legend-swatch good"></span>Healthy</span>
+            <span class="legend-key"><span class="legend-swatch warn"></span>Degraded</span>
+            <span class="legend-key"><span class="legend-swatch bad"></span>Outage</span>
+          </div>
+        </div>
+        <div class="timeline-summary" id="outageSummary"></div>
+        <div class="mini-chart outage-chart" id="outageTimeline"></div>
+        <div class="timeline-axis"><span id="outageStartLabel">Oldest</span><span>Most recent / now</span></div>
       </section>
       <section>
         <h2>Device Count Trend</h2>
@@ -2331,10 +2380,61 @@ DASHBOARD_HTML = """<!doctype html>
       }).join("") : row(["No devices match filters", "", "", "", "", "", "", "", "", "", ""]);
     }
     function renderOutageTimeline(points) {
-      const html = (points || []).map((point) => {
-        const cls = point.status === "outage" ? "bad" : point.status === "degraded" ? "warn" : "good";
-        const height = point.status === "outage" ? 100 : point.status === "degraded" ? 70 : 28;
-        return `<div class="mini-bar ${cls}" title="${esc(point.label)}: ${esc(point.status)}" style="height:${height}%"></div>`;
+      const source = points || [];
+      const summaryEl = document.getElementById("outageSummary");
+      const startEl = document.getElementById("outageStartLabel");
+      if (!source.length) {
+        summaryEl.innerHTML = "";
+        startEl.textContent = "Oldest";
+        document.getElementById("outageTimeline").innerHTML = "<div class='muted'>No check history yet.</div>";
+        return;
+      }
+
+      const statusRank = { healthy: 0, degraded: 1, outage: 2 };
+      const statusClass = { healthy: "good", degraded: "warn", outage: "bad" };
+      const statusLabel = { healthy: "Healthy", degraded: "Degraded", outage: "Outage" };
+      const counts = source.reduce((acc, point) => {
+        acc[point.status] = (acc[point.status] || 0) + 1;
+        return acc;
+      }, { healthy: 0, degraded: 0, outage: 0 });
+      const issueCount = counts.degraded + counts.outage;
+      const healthyPercent = source.length ? Math.round(counts.healthy / source.length * 1000) / 10 : 0;
+      const lastIssue = [...source].reverse().find((point) => point.status !== "healthy");
+      summaryEl.innerHTML = [
+        ["Window", `${source[0].label} to now`],
+        ["Healthy checks", `${healthyPercent}% (${counts.healthy}/${source.length})`],
+        ["Issues", issueCount ? `${counts.outage} outage / ${counts.degraded} degraded` : "None"],
+        ["Last issue", lastIssue ? `${statusLabel[lastIssue.status]} at ${lastIssue.label}` : "None in window"],
+      ].map(([label, value]) => `<div><span>${label}</span><strong>${esc(value)}</strong></div>`).join("");
+      startEl.textContent = source[0].label + " / oldest";
+
+      const maxBuckets = 72;
+      const bucketSize = Math.max(1, Math.ceil(source.length / maxBuckets));
+      const buckets = [];
+      for (let i = 0; i < source.length; i += bucketSize) {
+        const items = source.slice(i, i + bucketSize);
+        const worst = items.reduce((current, point) => statusRank[point.status] > statusRank[current.status] ? point : current, items[0]);
+        const bucketCounts = items.reduce((acc, point) => {
+          acc[point.status] = (acc[point.status] || 0) + 1;
+          return acc;
+        }, { healthy: 0, degraded: 0, outage: 0 });
+        buckets.push({ items, worst, counts: bucketCounts });
+      }
+      const html = buckets.map((bucket) => {
+        const status = bucket.worst.status;
+        const cls = statusClass[status] || "good";
+        const height = status === "outage" ? 100 : status === "degraded" ? 68 : 24;
+        const first = bucket.items[0];
+        const last = bucket.items[bucket.items.length - 1];
+        const bucketWorstLoss = Math.max(0, ...bucket.items.map((point) => Number(point.packet_loss_percent || 0)));
+        const bucketWorstLatency = Math.max(0, ...bucket.items.map((point) => Number(point.latency_ms || 0)));
+        const title = [
+          `${first.label} to ${last.label}`,
+          `Worst: ${statusLabel[status]}`,
+          `${bucket.counts.outage} outage, ${bucket.counts.degraded} degraded, ${bucket.counts.healthy} healthy checks`,
+          `Worst in block: ${fmt(bucketWorstLatency, " ms", 0)} latency, ${fmt(bucketWorstLoss, "%", 0)} loss`
+        ].join("\\n");
+        return `<div class="mini-bar ${cls}" title="${esc(title)}" style="height:${height}%"></div>`;
       }).join("");
       document.getElementById("outageTimeline").innerHTML = html || "<div class='muted'>No check history yet.</div>";
     }
